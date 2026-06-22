@@ -222,9 +222,7 @@ class BaseEPTokenDispatcher(LocalTokenDispatcher):
         batch_idx = local_indices // local_seq_len
         global_seq_len = local_seq_len * self.sp_size
         global_indices = batch_idx * global_seq_len + local_pos
-        return torch.add(  # pyrefly: ignore [no-matching-overload]
-            global_indices, self.sp_rank * local_seq_len
-        )
+        return torch.add(global_indices, self.sp_rank * local_seq_len)
 
     def dispatch(self, *args, **kwargs):
         raise NotImplementedError("BaseEPTokenDispatcher does not implement dispatch")
@@ -251,7 +249,6 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
     def __init__(self, config: Config):
         super().__init__(config)
 
-    # pyrefly: ignore [bad-override]
     def dispatch(
         self,
         x_TD: torch.Tensor,
@@ -428,7 +425,6 @@ class AllToAllTokenDispatcher(BaseEPTokenDispatcher):
         out_unpermuted_RD[permuted_indices, :] = routed_output_RD
         return out_unpermuted_RD
 
-    # pyrefly: ignore [bad-override]
     def combine(
         self,
         routed_output_RD: torch.Tensor,
@@ -619,7 +615,6 @@ class DeepEPTokenDispatcher(BaseEPTokenDispatcher):
         # instead of recomputing them. This must happen before apply_ac.
         from torchtitan.distributed.deepep import deepep  # noqa: F401
 
-    # pyrefly: ignore [bad-override]
     def dispatch(
         self,
         x_TD: torch.Tensor,
@@ -651,7 +646,6 @@ class DeepEPTokenDispatcher(BaseEPTokenDispatcher):
         metadata = DeepEPDispatchMetadata(state=state)
         return hidden_states_RD, num_global_tokens_per_local_expert_e, metadata
 
-    # pyrefly: ignore [bad-override]
     def combine(
         self,
         routed_output_RD: torch.Tensor,
@@ -747,7 +741,6 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
         # instead of recomputing them. This must happen before apply_ac.
         from torchtitan.distributed.deepep import hybridep  # noqa: F401
 
-    # pyrefly: ignore [bad-override]
     def dispatch(
         self,
         x_TD: torch.Tensor,
@@ -781,7 +774,6 @@ class HybridEPTokenDispatcher(BaseEPTokenDispatcher):
         metadata = DeepEPDispatchMetadata(state=state)
         return hidden_states_RD, num_global_tokens_per_local_expert_e, metadata
 
-    # pyrefly: ignore [bad-override]
     def combine(
         self,
         routed_output_RD: torch.Tensor,
@@ -852,7 +844,6 @@ class MinimalAsyncEPTokenDispatcher(LocalTokenDispatcher):
             buffer_device = torch.device(device_type, device_module.current_device())
         else:
             buffer_device = config.device
-        # pyrefly: ignore [read-only]
         self.buffer_device = buffer_device
 
     # MinimalAsyncEP has one process-global buffer: the first dispatcher

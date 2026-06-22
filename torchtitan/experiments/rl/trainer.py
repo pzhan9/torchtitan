@@ -431,6 +431,9 @@ class RLTrainer(Configurable):
                 request_id=request_id,
                 sampling_config=sampling_config,
                 metrics_prefix=generation_metrics_prefix,
+                # Forwarded to generator.generate for Layer-2 (in-mesh DP) sticky
+                # routing; routing_ctx (consumed by the Layer-1 router) is separate.
+                session_id=routing_session_id,
                 routing_ctx=RoutingContext(
                     estimated_cost=len(prompt_token_ids),
                     session_id=routing_session_id,

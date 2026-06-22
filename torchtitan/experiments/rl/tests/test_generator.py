@@ -29,6 +29,7 @@ from torchtitan.experiments.rl.actors.generator import (
 )
 from torchtitan.experiments.rl.models.vllm_registry import InferenceParallelismConfig
 from torchtitan.experiments.rl.observability import metrics as m
+from torchtitan.experiments.rl.routing import DPRequestRouter, RoundRobinRoutingStrategy
 
 
 class _FakeRenderer:
@@ -78,13 +79,21 @@ def _request_output(*, request_id="r0", outputs=None, num_generation_tokens=4):
     )
 
 
-def _generator():
+def _generator(*, dp_size=1, is_dp_master=True):
     """A bare generator (no __init__ / engine build) with just the CB state set."""
     generator = VLLMGenerator.__new__(VLLMGenerator)
     generator._engine = _FakeEngine()
     generator._rank = 0
     generator.policy_version = 7
     generator._generation_futures = {}
+    # DP fan-in state (DP=1 single group on rank 0 by default).
+    generator._dp_size = dp_size
+    generator._is_dp_master = is_dp_master
+    generator._request_metrics_prefix = {}
+    generator._request_dp_group = {}
+    generator._dp_router = DPRequestRouter(
+        RoundRobinRoutingStrategy.Config(), dp_size=dp_size
+    )
     generator.config = SimpleNamespace(
         sampling=SamplingConfig(temperature=0.0, top_p=1.0, max_tokens=4),
         debug=SimpleNamespace(seed=None),
@@ -95,15 +104,24 @@ def _generator():
 # --- completion (token-out) ---
 
 
-def test_process_finished_requests_resolves_future_with_completion():
+def _admit(generator, request_id, *, group=0, metrics_prefix="generator"):
+    """Mirror the engine loop's admit bookkeeping for one in-flight request."""
+    generator._request_metrics_prefix[request_id] = metrics_prefix
+    generator._request_dp_group[request_id] = group
+    generator._dp_router._handles[group].reserved_load += 1
+
+
+def test_dispatch_resolves_future_with_completion():
+    # DP=1: rank 0 is the (only) DP-master, so _dispatch builds + resolves locally.
     async def main():
         generator = _generator()
         future = asyncio.get_running_loop().create_future()
         generator._generation_futures = {
             "r0": GenerationFuture(future=future, metrics_prefix="generator")
         }
+        _admit(generator, "r0")
 
-        generator._process_finished_requests(
+        generator._dispatch_finished_requests(
             [
                 _request_output(
                     outputs=[_sample(token_ids=(10, 11), finish_reason="length")]
@@ -117,8 +135,11 @@ def test_process_finished_requests_resolves_future_with_completion():
         assert completion.token_logprobs == [-0.1, -0.1]
         assert completion.finish_reason == "length"
         assert completion.policy_version == 7
-        # The request is popped from the in-flight map.
+        # The request is popped from every in-flight map and its DP-group load freed.
         assert generator._generation_futures == {}
+        assert generator._request_metrics_prefix == {}
+        assert generator._request_dp_group == {}
+        assert not generator._dp_router.any_inflight
         # The per-generation metrics ride on the completion.
         assert (
             m.MetricsProcessor._aggregate_metrics(completion.metrics)[
@@ -130,12 +151,32 @@ def test_process_finished_requests_resolves_future_with_completion():
     asyncio.run(main())
 
 
-def test_process_finished_requests_noop_on_followers():
-    # Followers hold no futures, so completion is a no-op (it returns before touching outputs).
-    generator = _generator()
-    generator._rank = 1
-    generator._process_finished_requests([_request_output(request_id="r0")])
+def test_dispatch_noop_on_non_master():
+    # Non-DP-master ranks hold no futures, so dispatch returns before touching outputs.
+    generator = _generator(is_dp_master=False)
+    generator._dispatch_finished_requests([_request_output(request_id="r0")])
     assert generator._generation_futures == {}
+
+
+def test_resolve_completions_is_idempotent():
+    # The drain path tolerates a completion whose future was already resolved /
+    # is unknown -- it is skipped rather than raising.
+    async def main():
+        generator = _generator()
+        future = asyncio.get_running_loop().create_future()
+        generator._generation_futures = {
+            "r0": GenerationFuture(future=future, metrics_prefix="generator")
+        }
+        _admit(generator, "r0")
+        completions = generator._build_completions([_request_output(request_id="r0")])
+
+        generator._resolve_completions(completions)
+        assert (await future).request_id == "r0"
+        # Second delivery of the same (id, completion) is a no-op.
+        generator._resolve_completions(completions)
+        assert generator._generation_futures == {}
+
+    asyncio.run(main())
 
 
 # --- SamplingParams contract (must match the batched path exactly) ---

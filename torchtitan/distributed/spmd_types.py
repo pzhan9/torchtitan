@@ -230,7 +230,7 @@ def spmd_validate_redistributions(sharding_config: Any) -> None:
         # 3) If one side has no PartitionSpec, synthesize the simple
         # one-axis-per-dim form from its S(dim) local types.
         ndim = (
-            len(src.partition_spec)  # pyrefly: ignore [bad-argument-type]
+            len(src.partition_spec)
             if dst.partition_spec is None
             else len(dst.partition_spec)
         )
@@ -310,7 +310,6 @@ def spmd_redistribute_per_axis(
     assert mesh.mesh_dim_names is not None, "DeviceMesh must have named axes"
     for axis_name, dst_t in dst_types.items():
         src_t = src_types.get(axis_name)
-        # pyrefly: ignore [missing-attribute]
         axis = axis_name.value
         axis_size = (
             mesh.size(mesh.mesh_dim_names.index(axis))

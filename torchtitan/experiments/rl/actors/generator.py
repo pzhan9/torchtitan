@@ -18,7 +18,7 @@ from typing import Literal
 import torch
 import torch.distributed as dist
 import torchstore as ts
-from monarch.actor import Actor, current_rank, endpoint
+from monarch.actor import Actor, Channel, current_rank, endpoint, Port, PortReceiver
 from monarch.rdma import is_rdma_available
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.config import CompileConfig, Configurable, DebugConfig
@@ -33,6 +33,11 @@ from torchtitan.experiments.rl.models.vllm_registry import (
     TORCHTITAN_CONFIG_FORMAT,
 )
 from torchtitan.experiments.rl.observability import metrics as m
+from torchtitan.experiments.rl.routing import (
+    DPRequestRouter,
+    LeastLoadedRoutingStrategy,
+    RoutingStrategy,
+)
 from torchtitan.experiments.rl.types import Completion
 from torchtitan.models.common.attention import FlexAttention, VarlenAttention
 from torchtitan.observability import structured_logger as sl
@@ -221,24 +226,30 @@ class VLLMGenerator(Actor, Configurable):
     Notice that vLLM `engine.step`, which is a TP collective, and the request-intake are decoupled, so a new request
     can join mid-flight, instead of waiting for the current batch to drain.
 
-    One loop iteration, TP=2, after the controller fired generate(prompt_0) and generate(prompt_1):
+    With data_parallel_degree > 1 (Layer 2), rank 0 partitions the queued requests
+    across DP groups (see routing.py / _decide_next_action): each group runs a
+    DISJOINT slice for real DP throughput, and each group's TP-leader (DP-master)
+    sends its completions back to rank 0 over a Monarch port. DP=1 is the special
+    case "one group on rank 0", resolved locally with no port.
+
+    One loop iteration, TP=2 / DP=1, after the controller fired generate(prompt_0) and generate(prompt_1):
 
         # request intake in `generate` takes a prompt, puts in a queue, releases control back to the controller
         generate(prompt_0): enqueue prompt_0, await gen_future_0   ┐ rank 0 owns the queue + futures
         generate(prompt_1): enqueue prompt_1, await gen_future_1   ┘ (other ranks are no-op)
 
         # meanwhile, the engine-loop, which is its own coroutine, is continuously running.
-        rank 0   _decide_next_action -> LoopDecision(STEP, [prompt_0, prompt_1])─┐  broadcast_object_list (gloo)
-        rank 1   (blocked inside the broadcast) ─────────────────────────────────┘  decision from rank0 is broadcast
+        rank 0   _decide_next_action -> LoopDecision(STEP, requests_by_dp=[[prompt_0, prompt_1]])  broadcast (gloo)
+        rank 1   (blocked inside the broadcast)                     decision from rank0 is broadcast
 
-        # The loop now executes the decision. In this example: STEP.
+        # The loop now executes the decision. In this example: STEP. Each rank admits its own DP group's slice.
         ALL      add_request(prompt_0), add_request(prompt_1)
         ALL      engine.step() * max_engine_steps_between_decisions # N step burst before a new decision
 
         # resolve the future, waking up `generate` so it returns the result to the controller.
         # Note that prompt_1 can be done before prompt_0. The result is per request, not per batch.
-        rank 0   _process_finished_requests -> prompt_1 done? gen_future_1.set_result(Completion)
-        rank 1   _process_finished_requests -> no-op (holds no futures)
+        rank 0   _dispatch_finished_requests -> prompt_1 done? gen_future_1.set_result(Completion)
+        rank 1   _dispatch_finished_requests -> no-op (not a DP-master holding outputs / followers)
 
     A weight sync rides the same loop: `pull_model_state_dict` queues a `LoopDecision(LoopAction.PULL_MODEL_STATE_DICT)` applied
     between step bursts. The engine does NOT drain in-flight requests first ("hotswap"). This behavior can be changed
@@ -263,6 +274,15 @@ class VLLMGenerator(Actor, Configurable):
             default_factory=InferenceParallelismConfig
         )
         """Parallelism configuration for the vLLM engine."""
+
+        routing: RoutingStrategy.Config = field(
+            default_factory=LeastLoadedRoutingStrategy.Config
+        )
+        """In-mesh routing strategy: how rank 0 partitions requests across the
+        engine's data-parallel groups (no effect when data_parallel_degree == 1,
+        where there is a single group). Defaults to least-loaded; sticky-by-session
+        (``StickySessionRoutingStrategy.Config``) keeps a session's turns on one
+        group for prefix-cache reuse."""
 
         sampling: SamplingConfig = field(default_factory=SamplingConfig)
         """Default sampling parameters for generation."""
@@ -459,6 +479,28 @@ class VLLMGenerator(Actor, Configurable):
             asyncio.Condition()
         )  # Signals to wake up when there is work
 
+        # --- Data-parallel request routing (Layer 2; see the module docstring in
+        # routing.py and _engine_loop). vLLM lays ranks out DP-major / TP-minor, so
+        # data_parallel_rank == rank // ranks_per_dp and the TP-leader of each DP
+        # group is the lowest rank in it. For DP=1 this collapses to "the whole mesh
+        # is group 0 and rank 0 is its leader" -- routing/admit/decide are uniform
+        # across DP degrees; only the result fan-in differs (local vs. port). ---
+        self._dp_size = config.parallelism.data_parallel_degree
+        ranks_per_dp = dist.get_world_size() // self._dp_size
+        self._dp_group_idx = self._rank // ranks_per_dp
+        self._is_dp_master = self._rank % ranks_per_dp == 0
+
+        # Per-rank: metrics namespace for each admitted request, so the DP-master that
+        # built the completion tags timing metrics with the caller's prefix. Populated
+        # at admit (masters only), popped when the completion is built.
+        self._request_metrics_prefix: dict[str, str] = {}
+
+        # Result fan-in over a Monarch port (DP>1). The sendable Port is set on every
+        # rank by the one-time broadcast in _engine_loop; rank 0 also keeps the receiver.
+        self._result_port: Port | None = None
+        self._result_rx: PortReceiver | None = None
+        self._shutdown = False  # set in close() to stop the drain task
+
         # Engine-loop INBOX (rank 0): requests the controller submits; the loop reads them to decide.
         self._queued_generation_requests: list[GenerationRequest] = []
         self._model_state_dict_pull_request: ModelStateDictPullRequest | None = None
@@ -469,8 +511,17 @@ class VLLMGenerator(Actor, Configurable):
         self._generation_futures: dict[str, GenerationFuture] = {}
         self._pull_model_state_dict_future: asyncio.Future[int] | None = None
 
+        # RANK-0 routing bookkeeping: which DP group each in-flight request was routed
+        # to (so its load is released when the completion resolves) and the router that
+        # picks the group. any_inflight here -- not the engine's local check -- gates
+        # _decide_next_action so a busy peer group keeps rank 0 issuing STEPs.
+        self._dp_router = DPRequestRouter(config.routing, dp_size=self._dp_size)
+        self._request_dp_group: dict[str, int] = {}
+
         # Background asyncio.Task running _engine_loop; None until the first generate/pull starts it.
         self._engine_loop_task: asyncio.Task | None = None
+        # Background asyncio.Task draining the result port on rank 0 (DP>1 only).
+        self._drain_task: asyncio.Task | None = None
 
         logger.info("Generator initialized with vLLM engine")
 
@@ -512,6 +563,7 @@ class VLLMGenerator(Actor, Configurable):
         request_id: str,
         sampling_config: SamplingConfig | None = None,
         metrics_prefix: str = "generator",
+        session_id: str | None = None,
     ) -> Completion | None:
         """Generates one completion for one prompt.
 
@@ -527,6 +579,10 @@ class VLLMGenerator(Actor, Configurable):
             metrics_prefix: Namespace prepended to every metric key on the returned
                 `Completion` (default ``"generator"``). Callers that need to keep streams
                 separate, e.g. ``"validation/generator"``, can override it.
+            session_id: Stable session key consumed only by sticky in-mesh DP
+                routing; ignored by other strategies and when DP=1. The controller
+                forwards its Layer-1 ``routing_session_id`` here so a session's turns
+                can also stay pinned to one DP group for prefix-cache reuse.
 
         Example:
 
@@ -565,11 +621,16 @@ class VLLMGenerator(Actor, Configurable):
             )
 
             # Add the request to the queue; the engine loop will admit + process it.
+            # metrics_prefix and session_id ride on the request so they reach every
+            # rank in the broadcast: the routed DP-master needs the prefix to tag the
+            # completion's timing metrics, and sticky routing needs the session key.
             self._queued_generation_requests.append(
                 GenerationRequest(
                     request_id=request_id,
                     prompt_token_ids=prompt_token_ids,
                     sampling=sampling,
+                    metrics_prefix=metrics_prefix,
+                    session_id=session_id,
                 )
             )
             # Wakes the engine loop only if it is idle in `_decide_next_action`.
@@ -601,6 +662,8 @@ class VLLMGenerator(Actor, Configurable):
             check `_decide_next_action` --> "CLOSE"        --> stop
         """
         try:
+            # One-time: hand out the result-fan-in port (DP>1) before the first decision.
+            self._setup_result_port()
             while True:
                 # Rank 0 decides next decision; followers pass None and learn from the broadcast.
                 decision = await self._decide_next_action() if self._rank == 0 else None
@@ -632,19 +695,28 @@ class VLLMGenerator(Actor, Configurable):
                     continue  # back to the start for the next decision
 
                 if decision.action is LoopAction.STEP:
-                    # Add any newly-queued requests; all ranks add the identical set in FCFS order.
-                    if decision.requests:
+                    # Admit only THIS rank's DP-group slice. Every TP rank in a group
+                    # computes the same _dp_group_idx, so they admit the identical
+                    # subset in the identical FCFS order (required by fcfs scheduling).
+                    my_requests = decision.requests_by_dp[self._dp_group_idx]
+                    if my_requests:
                         # render_cmpl is vLLM's input pipeline (tokenize is a no-op for tokenized prompts);
                         # the high-level entry stays resilient to vLLM internals vs vllm.inputs.tokens_input.
                         engine_inputs = self._engine.renderer.render_cmpl(
                             [
                                 {"prompt_token_ids": request.prompt_token_ids}
-                                for request in decision.requests
+                                for request in my_requests
                             ]
                         )
                         for request, engine_input in zip(
-                            decision.requests, engine_inputs, strict=True
+                            my_requests, engine_inputs, strict=True
                         ):
+                            # Only the DP-master builds completions, so only it needs
+                            # the per-request metrics prefix (popped in _build_completions).
+                            if self._is_dp_master:
+                                self._request_metrics_prefix[
+                                    request.request_id
+                                ] = request.metrics_prefix
                             self._engine.add_request(
                                 request_id=request.request_id,
                                 prompt=engine_input,
@@ -656,12 +728,15 @@ class VLLMGenerator(Actor, Configurable):
                 # new requests and avoid a prefill in between every engine decode step, which is inefficient.
                 with sl.log_trace_span("vllm_engine_step_burst"):
                     for _ in range(self.config.max_engine_steps_between_decisions):
+                        # DP all-reduce (OR across groups): keeps every DP rank stepping
+                        # in lockstep and dummy-steps idle groups (vLLM). Distinct from
+                        # the rank-0-local check in _decide_next_action.
                         if not self._engine.has_unfinished_requests():
                             break
                         with torch.no_grad():
                             with sl.log_trace_span("vllm_engine_step"):
                                 request_outputs = self._engine.step()
-                        self._process_finished_requests(request_outputs)
+                        self._dispatch_finished_requests(request_outputs)
                         await asyncio.sleep(0)  # let pending generate() calls enqueue
 
         except Exception as exc:
@@ -679,33 +754,97 @@ class VLLMGenerator(Actor, Configurable):
                 lambda: self._close_request is not None
                 or self._model_state_dict_pull_request is not None
                 or self._queued_generation_requests
-                # rank-0-only decision: use the local (no DP all-reduce) check;
-                or self._engine.output_processor.has_unfinished_requests()
+                # rank-0-only decision: use rank 0's own per-group bookkeeping, NOT
+                # the engine's has_unfinished_requests (a DP all-reduce, which would
+                # deadlock here since followers are blocked in the broadcast, and
+                # would also miss a busy peer group while rank 0's own group is idle).
+                or self._dp_router.any_inflight
             )
 
             if self._close_request is not None:
-                return LoopDecision(action=LoopAction.CLOSE, requests=[])
+                return LoopDecision(action=LoopAction.CLOSE, requests_by_dp=[])
 
             # A weight pull takes priority over admitting new requests.
             if self._model_state_dict_pull_request is not None:
                 return LoopDecision(
                     action=LoopAction.PULL_MODEL_STATE_DICT,
-                    requests=[],
+                    requests_by_dp=[],
                     pull_version=self._model_state_dict_pull_request.version,
                 )
 
-            # STEP: admit whatever is queued (may be empty -> just keep stepping in-flight work).
-            requests, self._queued_generation_requests = (
+            # STEP: partition newly-queued requests across DP groups (may be all-empty
+            # -> just keep stepping in-flight work). Record each request's group so its
+            # load is released when the completion resolves.
+            queued, self._queued_generation_requests = (
                 self._queued_generation_requests,
                 [],
             )
-            return LoopDecision(action=LoopAction.STEP, requests=requests)
+            requests_by_dp: list[list[GenerationRequest]] = [
+                [] for _ in range(self._dp_size)
+            ]
+            for request in queued:
+                group = self._dp_router.choose(
+                    session_id=request.session_id,
+                    estimated_cost=len(request.prompt_token_ids),
+                )
+                requests_by_dp[group].append(request)
+                self._request_dp_group[request.request_id] = group
+            return LoopDecision(action=LoopAction.STEP, requests_by_dp=requests_by_dp)
 
-    def _process_finished_requests(self, request_outputs: list[RequestOutput]) -> None:
-        """RANK 0: resolve each finished request's future with its `Completion` (metrics included)."""
-        if self._rank != 0:
-            return  # other ranks hold no futures
+    def _setup_result_port(self) -> None:
+        """Distribute the result-fan-in port once, before the engine loop runs (DP>1 only).
 
+        Rank 0 opens a persistent Monarch port and keeps the receiver; the sendable
+        `Port` is broadcast over the gloo group so every DP-master can push its
+        completions straight to rank 0's mailbox (no collective on the result path).
+        Rank 0 then starts the drain task.
+
+        This broadcast runs on the actor's MAIN event-loop thread (not via
+        `asyncio.to_thread` like the per-step decision broadcast): `Port.__reduce__`
+        binds the port to the receiving rank's actor context at unpickle, and that
+        ambient context is only present on the main thread. It is one-time setup, so
+        briefly blocking the loop is fine.
+        """
+        if self._dp_size == 1:
+            return  # whole mesh is one group on rank 0; results resolve locally.
+
+        if self._rank == 0:
+            self._result_port, self._result_rx = Channel.open()
+        container = [self._result_port if self._rank == 0 else None]
+        dist.broadcast_object_list(
+            container, src=0, group=self._broadcast_group, device=torch.device("cpu")
+        )
+        self._result_port = container[0]
+        if self._rank == 0:
+            self._drain_task = asyncio.create_task(self._drain_results())
+
+    def _dispatch_finished_requests(self, request_outputs: list[RequestOutput]) -> None:
+        """Per DP-master, after each `engine.step()`: hand finished completions to rank 0.
+
+        Rank 0 resolves its own group's completions directly; other DP-masters push
+        them over the port to rank 0's drain task. Non-master ranks hold no futures
+        and do nothing (matches the pre-DP follower no-op).
+        """
+        if not self._is_dp_master:
+            return
+
+        completions = self._build_completions(request_outputs)
+        if self._rank == 0:
+            self._resolve_completions(completions)
+        elif completions:
+            # Fire-and-forget, direct master -> rank 0 mailbox; reliable + in-order.
+            self._result_port.send(completions)
+
+    def _build_completions(
+        self, request_outputs: list[RequestOutput]
+    ) -> list[tuple[str, Completion]]:
+        """DP-master: turn finished `RequestOutput`s into `(request_id, Completion)`.
+
+        Rank-agnostic: builds only the per-generation timing metrics (tagged with the
+        request's own prefix). The rank-0-only `inflight_requests_at_completion` metric
+        is appended later, at resolve time, by `_resolve_completions`.
+        """
+        completions: list[tuple[str, Completion]] = []
         for request_output in request_outputs:
             # We enforce n=1 in sampling params -> exactly one CompletionOutput per finished request
             # Here we just sanity check it (a single engine.step may still finish several requests).
@@ -715,42 +854,73 @@ class VLLMGenerator(Actor, Configurable):
                     f"{len(request_output.outputs)} for {request_output.request_id}"
                 )
 
-            # in flight when this one finished (includes itself; counted before the pop)
-            inflight_requests_at_completion = float(len(self._generation_futures))
-            generation_future = self._generation_futures.pop(request_output.request_id)
-
-            # get logprobs
             completion_output = request_output.outputs[0]
             token_logprobs = [
                 next(iter(logprob_dict.values())).logprob
                 for logprob_dict in completion_output.logprobs
             ]
 
-            # prepare metrics
-            metrics_prefix = generation_future.metrics_prefix
+            metrics_prefix = self._request_metrics_prefix.pop(request_output.request_id)
             metrics = _prepare_generation_request_metrics(
                 request_output, prefix=metrics_prefix
             )
 
+            completions.append(
+                (
+                    request_output.request_id,
+                    Completion(
+                        policy_version=self.policy_version,
+                        request_id=request_output.request_id,
+                        token_ids=list(completion_output.token_ids),
+                        token_logprobs=token_logprobs,
+                        finish_reason=completion_output.finish_reason,
+                        metrics=metrics,
+                    ),
+                )
+            )
+        return completions
+
+    def _resolve_completions(self, completions: list[tuple[str, Completion]]) -> None:
+        """RANK 0: resolve each completion's future and release its DP-group load.
+
+        Called both for rank 0's own group (inline in the loop) and for peer groups
+        (from the drain task). The `pop(..., None)` makes resolution idempotent, and
+        there is no `await` in the body, so under cooperative asyncio it never races
+        the loop on `_generation_futures`.
+        """
+        for request_id, completion in completions:
+            generation_future = self._generation_futures.pop(request_id, None)
+            if generation_future is None:
+                continue  # already resolved / unknown (idempotent)
+
+            # in flight when this one finished (includes itself; +1 because it was
+            # just popped). Appended here, not in _build_completions, because the
+            # count and the namespace (the future's prefix) live only on rank 0.
+            inflight_requests_at_completion = float(len(self._generation_futures) + 1)
+            metrics_prefix = generation_future.metrics_prefix
             for metric_type in [m.Max, m.Mean]:
-                metrics.append(
+                completion.metrics.append(
                     m.Metric(
                         f"{metrics_prefix}/inflight_requests_at_completion",
                         metric_type(inflight_requests_at_completion),
                     )
                 )
 
-            # resolve the future
-            generation_future.future.set_result(
-                Completion(
-                    policy_version=self.policy_version,
-                    request_id=request_output.request_id,
-                    token_ids=list(completion_output.token_ids),
-                    token_logprobs=token_logprobs,
-                    finish_reason=completion_output.finish_reason,
-                    metrics=metrics,
-                )
-            )
+            generation_future.future.set_result(completion)
+
+            group = self._request_dp_group.pop(request_id, None)
+            if group is not None:
+                self._dp_router.release(group)
+
+    async def _drain_results(self) -> None:
+        """RANK 0 background task (DP>1): drain DP-masters' completions off the port.
+
+        `recv()` is async, so this wakes only at the engine loop's await points (never
+        mid-`engine.step()`); resolving has no `await`, so it never races the loop.
+        """
+        while not self._shutdown:
+            completions = await self._result_rx.recv()
+            self._resolve_completions(completions)
 
     def _fail_outstanding_futures(self, exc: BaseException) -> None:
         """Fail every unresolved future after an exception or engine teardown."""
@@ -880,6 +1050,17 @@ class VLLMGenerator(Actor, Configurable):
                 logger.exception("engine loop raised during shutdown")
             self._engine_loop_task = None
 
+        # Stop the result-drain task (rank 0, DP>1). recv() blocks with no
+        # non-blocking poll, so cancel it; the loop has already stopped sending.
+        self._shutdown = True
+        if self._drain_task is not None:
+            self._drain_task.cancel()
+            try:
+                await self._drain_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._drain_task = None
+
         # The loop has stopped; fail any futures it left unresolved so awaiting callers get an
         # exception instead of hanging.
         self._fail_outstanding_futures(
@@ -908,6 +1089,11 @@ class GenerationRequest:
     request_id: str
     prompt_token_ids: list[int]  # [prompt_tokens]
     sampling: SamplingConfig
+    metrics_prefix: str = "generator"
+    # Namespace for the per-generation metrics; broadcast so the routed DP-master
+    # (which builds the completion) tags them the same as the caller asked.
+    session_id: str | None = None
+    # Stable session key for sticky in-mesh DP routing; ignored by other strategies.
 
 
 @dataclass(kw_only=True, slots=True)
@@ -955,8 +1141,10 @@ class LoopDecision:
 
     action: LoopAction
 
-    requests: list[GenerationRequest] | None = None
-    # requests to admit before a STEP burst (empty unless any queued)
+    requests_by_dp: list[list[GenerationRequest]] | None = None
+    # per-DP-group requests to admit before a STEP burst; index == DP group, fixed
+    # length data_parallel_degree. Each rank admits only its own group's slice.
+    # Empty list for CLOSE / PULL.
 
     pull_version: int | None = None
     # set iff action is PULL_MODEL_STATE_DICT

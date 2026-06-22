@@ -4,20 +4,40 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Generator routing."""
+"""Generator routing (Layer 1: across generator meshes / replicas).
+
+The routing-strategy policy objects live in ``routing.py`` so they can be shared
+with the in-mesh DP router (``DPRequestRouter``). They are re-exported here for
+backward compatibility with existing imports.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import itertools
-from abc import ABC, abstractmethod
-from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import auto, Enum
 from typing import Any
 
 from torchtitan.config import Configurable
+from torchtitan.experiments.rl.routing import (
+    LeastLoadedRoutingStrategy,
+    RoundRobinRoutingStrategy,
+    RoutingCandidate,
+    RoutingContext,
+    RoutingStrategy,
+    StickySessionRoutingStrategy,
+)
+
+__all__ = [
+    "GeneratorRouter",
+    "LeastLoadedRoutingStrategy",
+    "RoundRobinRoutingStrategy",
+    "RoutingCandidate",
+    "RoutingContext",
+    "RoutingStrategy",
+    "StickySessionRoutingStrategy",
+]
 
 
 class _GeneratorState(Enum):
@@ -42,151 +62,6 @@ class _GeneratorHandle:
 
     idle: asyncio.Event = field(default_factory=asyncio.Event)
     """Set when this generator has no reserved routed calls."""
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class RoutingContext:
-    """Routing metadata for one generation request."""
-
-    estimated_cost: int = 1
-    """Estimated request cost used by load-aware routing strategies."""
-
-    session_id: str | None = None
-    """Stable session key consumed only by sticky routing strategies; other
-    strategies ignore it. ``None`` means the request is unpinned and uses fallback
-    routing without session affinity."""
-
-
-class RoutingStrategy(Configurable, ABC):
-    """Policy object that chooses one generator for a request.
-
-    Add a new strategy by subclassing this, defining a nested ``Config``, and
-    selecting it explicitly in config, e.g.
-    ``GeneratorRouter.Config(strategy=MyRoutingStrategy.Config())``.
-    """
-
-    def __init__(self, config: Configurable.Config):
-        # Stateless by default; stateful strategies override __init__.
-        del config
-
-    @abstractmethod
-    def choose(
-        self,
-        routing_ctx: RoutingContext,
-        candidates: Sequence[_GeneratorHandle],
-    ) -> _GeneratorHandle:
-        """Choose one generator from the (non-empty) serving candidates."""
-
-
-class RoundRobinRoutingStrategy(RoutingStrategy):
-    """Cycle over the serving generators in order, ignoring load."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Configurable.Config):
-        pass
-
-    def __init__(self, config: Config):
-        del config
-        self._counter = itertools.count()
-
-    def choose(
-        self,
-        routing_ctx: RoutingContext,
-        candidates: Sequence[_GeneratorHandle],
-    ) -> _GeneratorHandle:
-        """Return the next serving generator in round-robin order."""
-
-        del routing_ctx
-        return candidates[next(self._counter) % len(candidates)]
-
-
-class LeastLoadedRoutingStrategy(RoutingStrategy):
-    """Pick the serving generator with the least controller-reserved load."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Configurable.Config):
-        pass
-
-    def choose(
-        self,
-        routing_ctx: RoutingContext,
-        candidates: Sequence[_GeneratorHandle],
-    ) -> _GeneratorHandle:
-        """Return the serving generator with the lowest reserved load."""
-
-        del routing_ctx
-        return min(candidates, key=lambda h: h.reserved_load)
-
-
-class StickySessionRoutingStrategy(RoutingStrategy):
-    """Keep requests from the same session on the same generator."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Configurable.Config):
-        max_sessions: int = 4096
-        """Maximum number of session-to-generator assignments to retain,
-        evicting least-recently-used sessions first."""
-
-        fallback_strategy: RoutingStrategy.Config = field(
-            default_factory=LeastLoadedRoutingStrategy.Config
-        )
-        """Routing strategy used for new sessions and requests without a session."""
-
-        def __post_init__(self):
-            if self.max_sessions <= 0:
-                raise ValueError(
-                    f"max_sessions must be positive, got {self.max_sessions}"
-                )
-
-    def __init__(self, config: Config):
-        self._max_sessions = config.max_sessions
-        self._fallback_strategy = config.fallback_strategy.build()
-        self._sessions: OrderedDict[str, _GeneratorHandle] = OrderedDict()
-
-    def choose(
-        self,
-        routing_ctx: RoutingContext,
-        candidates: Sequence[_GeneratorHandle],
-    ) -> _GeneratorHandle:
-        """Return the session's assigned generator, or assign a new one.
-
-        Unpinned requests (no ``session_id``) and first-seen sessions defer to
-        the fallback strategy; a session's first assignment is then remembered so
-        every later request with that key reuses the same generator. If a
-        session's pinned generator is no longer a serving candidate (e.g. it is
-        draining for a weight sync), the request falls back and the session is
-        re-pinned to the newly chosen generator. The map is bounded by
-        ``max_sessions`` and evicts the least-recently-used session.
-        """
-
-        # Unpinned request: no affinity, defer entirely to the fallback.
-        if routing_ctx.session_id is None:
-            return self._fallback_strategy.choose(routing_ctx, candidates)
-
-        # Reuse the pinned generator, but only while it is still a serving
-        # candidate (e.g. not draining for a weight sync).
-        sticky_generator = self._sessions.get(routing_ctx.session_id)
-        if sticky_generator is not None:
-            if any(h is sticky_generator for h in candidates):
-                # End of the dict means it's the most-recently-used session.
-                self._sessions.move_to_end(routing_ctx.session_id)
-                return sticky_generator
-
-        # New session, or the pinned generator is unavailable: choose via the
-        # fallback and (re)pin the session to that generator.
-        chosen = self._fallback_strategy.choose(routing_ctx, candidates)
-        self._sessions[routing_ctx.session_id] = chosen
-        # End of the dict means it's the most-recently-used session.
-        self._sessions.move_to_end(routing_ctx.session_id)
-        # Evict the least-recently-used session if the map is full. We assume
-        # max_sessions is large enough that active sessions are never the LRU
-        # victim (only stale, finished sessions get evicted).
-        # TODO: relying solely on max_sessions to avoid premature eviction is
-        # easy to implement, but not robust for all scenarios. Revisit with an
-        # more robust approach.
-        if len(self._sessions) > self._max_sessions:
-            self._sessions.popitem(last=False)
-        return chosen
 
 
 class GeneratorRouter(Configurable):
