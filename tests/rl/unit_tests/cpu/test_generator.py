@@ -8,7 +8,7 @@
 
 Exercises the per-request pieces in isolation with a fake vLLM engine — no Monarch,
 no GPU, no real model, and no broadcast (the engine loop's broadcast/step is a TP collective,
-not unit-tested here; `test_engine_loop.py` covers the decision logic in `_decide_next_action`).
+not unit-tested here; `test_engine_loop.py` covers `_decide_next_action` and the engine thread).
 Covers completion (token-out + the metrics that ride with it),
 the SamplingParams contract, and the vLLM metric timing math.
 """
@@ -138,6 +138,7 @@ def test_process_finished_requests_resolves_future_with_completion():
                 )
             ],
             policy_version=8,
+            event_loop=asyncio.get_running_loop(),
         )
 
         completion = await future
@@ -165,7 +166,7 @@ def test_process_finished_requests_noop_on_nonzero_tp_rank():
     dispatcher = _dispatcher(rank=1, dp_degree=1, tp_degree=2)
     assert dispatcher._tp_rank != 0
     dispatcher.process_finished_requests(
-        [_request_output(request_id="r0")], policy_version=7
+        [_request_output(request_id="r0")], policy_version=7, event_loop=None
     )
     assert dispatcher._rank0_generation_futures == {}
 
@@ -184,7 +185,9 @@ def test_process_finished_requests_releases_dp_router_load():
         assert [h.reserved_load for h in dispatcher._rank0_dp_router._handles] == [1, 0]
 
         dispatcher.process_finished_requests(
-            [_request_output(request_id="r0")], policy_version=7
+            [_request_output(request_id="r0")],
+            policy_version=7,
+            event_loop=asyncio.get_running_loop(),
         )
 
         await future
