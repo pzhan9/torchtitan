@@ -87,10 +87,10 @@ class _FakeConfig:
         return _FakeController(config=self)
 
 
-class _FakeConfigManager:
+class _FakeConfigLoader:
     config = _FakeConfig()
 
-    def parse_args(self):
+    def load(self):
         return self.config
 
 
@@ -153,6 +153,9 @@ def _make_stub_rl_trainer():
         def to_dict(self):
             return {}
 
+        def maybe_log(self) -> None:
+            pass
+
     return train.Controller(_StubConfig())
 
 
@@ -178,9 +181,9 @@ def stub_mesh_provisioning(monkeypatch):
 
 
 def test_main_shuts_down_after_success(monkeypatch, stub_mesh_provisioning):
-    _FakeConfigManager.config = _FakeConfig()
+    _FakeConfigLoader.config = _FakeConfig()
     _FakeController.instances = []
-    monkeypatch.setattr(train, "ConfigManager", _FakeConfigManager)
+    monkeypatch.setattr(train, "ConfigLoader", _FakeConfigLoader)
 
     asyncio.run(train.main())
 
@@ -191,9 +194,9 @@ def test_main_shuts_down_after_success(monkeypatch, stub_mesh_provisioning):
 
 
 def test_main_passes_configured_num_generators(monkeypatch, stub_mesh_provisioning):
-    _FakeConfigManager.config = _FakeConfig(num_generators=2)
+    _FakeConfigLoader.config = _FakeConfig(num_generators=2)
     _FakeController.instances = []
-    monkeypatch.setattr(train, "ConfigManager", _FakeConfigManager)
+    monkeypatch.setattr(train, "ConfigLoader", _FakeConfigLoader)
 
     asyncio.run(train.main())
 
@@ -206,9 +209,9 @@ def test_main_passes_configured_num_generators(monkeypatch, stub_mesh_provisioni
 
 
 def test_main_shuts_down_after_train_failure(monkeypatch, stub_mesh_provisioning):
-    _FakeConfigManager.config = _FakeConfig(fail_train=True)
+    _FakeConfigLoader.config = _FakeConfig(fail_train=True)
     _FakeController.instances = []
-    monkeypatch.setattr(train, "ConfigManager", _FakeConfigManager)
+    monkeypatch.setattr(train, "ConfigLoader", _FakeConfigLoader)
 
     with pytest.raises(RuntimeError, match="train failed"):
         asyncio.run(train.main())
@@ -217,9 +220,9 @@ def test_main_shuts_down_after_train_failure(monkeypatch, stub_mesh_provisioning
 
 
 def test_main_shuts_down_after_setup_failure(monkeypatch, stub_mesh_provisioning):
-    _FakeConfigManager.config = _FakeConfig(fail_setup=True)
+    _FakeConfigLoader.config = _FakeConfig(fail_setup=True)
     _FakeController.instances = []
-    monkeypatch.setattr(train, "ConfigManager", _FakeConfigManager)
+    monkeypatch.setattr(train, "ConfigLoader", _FakeConfigLoader)
 
     with pytest.raises(RuntimeError, match="setup failed"):
         asyncio.run(train.main())
@@ -237,17 +240,16 @@ def test_rl_trainer_shutdown_is_noop_before_meshes_spawn():
     assert trainer._proc_meshes == []
 
 
-def test_main_swallows_cancellation_after_shutdown(monkeypatch, stub_mesh_provisioning):
+def test_main_reraises_cancellation_after_shutdown(monkeypatch, stub_mesh_provisioning):
     """Signal-driven cancellation surfaces as ``CancelledError`` from the
-    running task; ``main`` runs ``close`` in ``finally`` and the explicit
-    ``except`` clause swallows the interrupt so the process exits 0
-    without a traceback."""
-    _FakeConfigManager.config = _FakeConfig(cancel_train=True)
+    running task. Monarch delivers unhandled actor faults the same way, so
+    ``main`` runs ``close`` and re-raises to exit nonzero."""
+    _FakeConfigLoader.config = _FakeConfig(cancel_train=True)
     _FakeController.instances = []
-    monkeypatch.setattr(train, "ConfigManager", _FakeConfigManager)
+    monkeypatch.setattr(train, "ConfigLoader", _FakeConfigLoader)
 
-    # No exception escapes; close still ran.
-    asyncio.run(train.main())
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(train.main())
 
     assert _FakeController.instances[0].events == ["setup", "train", "close"]
 

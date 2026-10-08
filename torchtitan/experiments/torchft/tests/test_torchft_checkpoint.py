@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 
 from torchtitan.components.checkpointer import CheckpointManager
 
-from torchtitan.components.optimizer import AdamW, EMA, LRSchedulersContainer
+from torchtitan.components.optim import AdamW, EMA, LRSchedulersContainer
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
 from torchtitan.experiments.torchft.manager import TorchFTManager
 from torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainer
@@ -173,7 +173,9 @@ class TestFTCheckpointManager(unittest.TestCase):
 
         manager.close()
 
-    def _manager(self, participating_rank: int) -> TorchFTCheckpointManager:
+    def _manager(
+        self, participating_rank: int, *, cursor_enabled: bool = True
+    ) -> TorchFTCheckpointManager:
         config = TorchFTCheckpointManager.Config(
             async_mode="disabled",
             folder=self.test_folder,
@@ -184,7 +186,7 @@ class TestFTCheckpointManager(unittest.TestCase):
             exclude_from_loading=[],
             initial_load_path=None,
             initial_load_model_only=False,
-            enable_ft_dataloader_checkpoints=True,
+            enable_ft_dataloader_checkpoints=cursor_enabled,
         )
         return TorchFTCheckpointManager(
             config,
@@ -219,6 +221,23 @@ class TestFTCheckpointManager(unittest.TestCase):
             bystander = self._manager(participating_rank=1)
             self.assertIs(False, bystander.save(curr_step=5))
             bystander.close()
+
+    def test_non_owner_skips_save_and_purge_when_cursor_disabled(self):
+        manager = self._manager(participating_rank=1, cursor_enabled=False)
+        self.addCleanup(manager.close)
+        # Enable retention so the base purge conditions allow this rank to purge.
+        manager.keep_latest_k = 2
+
+        with (
+            mock.patch("torch.distributed.get_rank", return_value=0),
+            mock.patch.object(dist_checkpoint, "save") as full_save,
+        ):
+            saved = manager.save(curr_step=1)
+            should_purge = manager._should_purge()
+
+        self.assertIs(saved, False)
+        full_save.assert_not_called()
+        self.assertIs(should_purge, False)
 
     def test_load_restores_ft_checkpoint_after_main_checkpoint(self):
         manager = self._manager(participating_rank=0)
@@ -272,12 +291,16 @@ class TestFTCheckpointManager(unittest.TestCase):
                 ],
             ),
             model_parts=[model],
-            ft_manager=ft_manager,
         )
+        optimizers.configure_fault_tolerance(ft_manager)
         schedulers = LRSchedulersContainer.Config(warmup_steps=0).build(
             optimizers=optimizers, training_steps=8
         )
-        ema = EMA.Config().build(model_parts=[model]) if with_ema else self.ema
+        ema = (
+            EMA.Config(half_life_fractions=[0.05]).build(model_parts=[model])
+            if with_ema
+            else self.ema
+        )
         checkpoint = TorchFTCheckpointManager(
             TorchFTCheckpointManager.Config(
                 folder=os.path.join(self.test_folder, str(replica_id)),

@@ -48,8 +48,8 @@ class TestTensorParallelFeedForwardNumerics(DTensorTestBase):
                 base_config = make_ffn_config(
                     dim=dim,
                     hidden_dim=hidden_dim,
-                    w1_param_init=init,
-                    w2w3_param_init=init,
+                    w13_param_init=init,
+                    w2_param_init=init,
                 )
                 reference = copy.deepcopy(base_config).build().to(device)
                 parallel_config = copy.deepcopy(base_config)
@@ -141,15 +141,13 @@ class TestTensorParallelFeedForwardNumerics(DTensorTestBase):
         base_config = make_shared_expert_ffn_config(
             dim=dim,
             hidden_dim=hidden_dim,
-            enable_sp=False,
-            w1_param_init=init,
-            w2w3_param_init=init,
+            w13_param_init=init,
+            w2_param_init=init,
         )
         reference = copy.deepcopy(base_config).build().to(device)
         parallel_config = copy.deepcopy(base_config)
         set_shared_moe_sharding_config(
             parallel_config,
-            enable_ep=True,
             enable_sp=False,
         )
         parallel = parallel_config.build().to(device)
@@ -221,15 +219,13 @@ class TestTensorParallelFeedForwardNumerics(DTensorTestBase):
         base_config = make_shared_expert_ffn_config(
             dim=dim,
             hidden_dim=hidden_dim,
-            enable_sp=True,
-            w1_param_init=init,
-            w2w3_param_init=init,
+            w13_param_init=init,
+            w2_param_init=init,
         )
         reference = copy.deepcopy(base_config).build().to(device)
         parallel_config = copy.deepcopy(base_config)
         set_shared_moe_sharding_config(
             parallel_config,
-            enable_ep=True,
             enable_sp=True,
         )
         parallel = parallel_config.build().to(device)

@@ -35,7 +35,7 @@ from torchtitan.components.checkpointer import (
     TRAIN_STATE,
 )
 from torchtitan.components.data.loader import BaseDataLoader
-from torchtitan.components.optimizer import (  # noqa: N811
+from torchtitan.components.optim import (  # noqa: N811
     EMA as EMAContainer,
     LRSchedulersContainer,
     OptimizersContainer,
@@ -44,7 +44,7 @@ from torchtitan.experiments.torchft.manager import TorchFTManager
 from torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainer
 from torchtitan.protocols.state_dict_adapter import BaseStateDictAdapter
 from torchtitan.tools import filesystem
-from torchtitan.tools.utils import GarbageCollection
+from torchtitan.tools.garbage_collector import GarbageCollector
 
 
 logger = logging.getLogger(__name__)
@@ -156,19 +156,14 @@ class TorchFTCheckpointManager(CheckpointManager):
         if self.enable_ft_dataloader_checkpoints:
             self._ft_save(curr_step)
 
-        if not self.enable_ft_dataloader_checkpoints or (
-            self.ft_manager
-            # pyrefly: ignore [missing-attribute]
-            and self.ft_manager.participating_rank() == 0
-        ):
+        if self._is_checkpoint_owner():
             return super()._save(curr_step, last_step)
-        if self.enable_ft_dataloader_checkpoints:
-            assert self.ft_manager is not None
-            logger.info(
-                "Replica %d doesn't save checkpoint.",
-                # pyrefly: ignore [missing-attribute]
-                self.ft_manager.participating_rank(),
-            )
+        assert self.ft_manager is not None
+        logger.info(
+            "Replica %s doesn't save the full checkpoint.",
+            # pyrefly: ignore [missing-attribute]
+            self.ft_manager.participating_rank(),
+        )
         # The per-replica dataloader checkpoint above is a side channel, not the
         # checkpoint this return value describes, so a replica that skipped the
         # full save reports False.
@@ -212,13 +207,15 @@ class TorchFTCheckpointManager(CheckpointManager):
         if self.async_mode != AsyncMode.ASYNC_WITH_PINNED_MEM:
             self.save_future = None
 
+    def _is_checkpoint_owner(self) -> bool:
+        if self.ft_manager is None:
+            return True
+        # A missing participating rank does not grant checkpoint ownership.
+        # pyrefly: ignore [missing-attribute]
+        return self.ft_manager.participating_rank() == 0
+
     def _should_purge(self) -> bool:
-        if not super()._should_purge():
-            return False
-        if self.enable_ft_dataloader_checkpoints:
-            # pyrefly: ignore [missing-attribute]
-            return bool(self.ft_manager and self.ft_manager.participating_rank() == 0)
-        return True
+        return super()._should_purge() and self._is_checkpoint_owner()
 
     def _ft_folder(self) -> str:
         return filesystem.join(self.folder, f"ft-replicat-{self.ft_replica_id}")
@@ -250,7 +247,7 @@ class TorchFTCheckpointManager(CheckpointManager):
             from_hf=False,
             from_quantized=False,
         )
-        GarbageCollection.collect("GC collection for checkpoint loading.")
+        GarbageCollector.collect("GC collection for checkpoint loading.")
         logger.info(
             f"Finished loading the torchft checkpoint in "
             f"{time.monotonic() - begin:.2f} seconds."

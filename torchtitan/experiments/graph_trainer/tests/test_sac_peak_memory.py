@@ -14,7 +14,7 @@ import torch.nn as nn
 from torchtitan.components.data.types import TokenizedTrainingMicrobatch
 from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
 from torchtitan.experiments.graph_trainer.llama3 import (
-    model_registry as llama3_registry,
+    build_model_config as build_llama3_model_config,
 )
 from torchtitan.experiments.graph_trainer.tests._trainer_test_utils import (
     build_minimal_trainer,
@@ -36,7 +36,7 @@ def _set_deterministic() -> None:
 
 
 def _build_model(model_flavor: str, attn_backend: str = "flex") -> nn.Module:
-    model_config = llama3_registry(model_flavor, attn_backend=attn_backend)
+    model_config = build_llama3_model_config(model_flavor, attn_backend=attn_backend)
     with torch.device("meta"):
         model = model_config.build()
     model.to_empty(device="cuda")
@@ -60,7 +60,9 @@ def _measure_step(
 ) -> StepResult:
     model = trainer.engine.model_parts[0]
     model.zero_grad(set_to_none=True)
-    global_valid_tokens = torch.tensor(labels.numel(), dtype=torch.float, device="cuda")
+    global_loss_token_counts = torch.tensor(
+        labels.numel(), dtype=torch.float, device="cuda"
+    )
     # The dataloader always supplies per-document positions, which the trainer
     # requires to build the FlexInnerAttention mask. Reset positions between the
     # packed documents.
@@ -68,24 +70,28 @@ def _measure_step(
 
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
-    loss = trainer.engine.forward_backward_microbatch(
-        microbatch_group=[
-            TokenizedTrainingMicrobatch(
-                input=tokens,
-                positions=positions,
-                labels=labels,
-                padding_mask=torch.zeros_like(labels, dtype=torch.bool),
-                num_valid_tokens=labels.numel(),
-            )
+    result = trainer.engine.forward_backward(
+        microbatch_groups=[
+            [
+                TokenizedTrainingMicrobatch(
+                    input=tokens,
+                    positions=positions,
+                    labels=labels,
+                    padding_mask=torch.zeros_like(labels, dtype=torch.bool),
+                    loss_token_counts=torch.tensor(labels.numel()),
+                    routing_token_counts=torch.tensor([labels.numel()]),
+                )
+            ]
         ],
-        global_valid_tokens=global_valid_tokens,
+        global_loss_token_counts=global_loss_token_counts,
+        global_routing_token_counts=global_loss_token_counts.unsqueeze(0),
     )
     torch.cuda.synchronize()
 
     stats = torch.cuda.memory_stats()
     grads = [param.grad.detach().clone() for param in model.parameters()]
     return StepResult(
-        loss=loss.detach().clone(),
+        loss=result.loss.detach().clone(),
         grads=grads,
         reserved_gib=torch.cuda.max_memory_reserved() / 1e9,
         active_gib=stats["active_bytes.all.peak"] / 1e9,
@@ -119,7 +125,7 @@ class TestGraphSACPeakMemory(unittest.TestCase):
         SelectiveAC.Config().build().apply(eager_model)
         eager_trainer = build_minimal_trainer(
             eager_model,
-            llama3_registry(DEBUGMODEL),
+            build_llama3_model_config(DEBUGMODEL),
             Trainer,
             parallelism_context=self.parallelism_context,
         )
@@ -128,14 +134,14 @@ class TestGraphSACPeakMemory(unittest.TestCase):
         traced_model.load_state_dict(copy.deepcopy(self.state_dict))
         traced_trainer = build_minimal_trainer(
             traced_model,
-            llama3_registry(DEBUGMODEL),
+            build_llama3_model_config(DEBUGMODEL),
             GraphTrainer,
             activation_checkpoint_mode="selective",
             parallelism_context=self.parallelism_context,
         )
-        # Use eager-compatible SAC policy (alternating mm save/recompute)
-        # to match the eager AC path's memory behavior.
-        traced_trainer.config.compile.memory_policy = "eager"
+        # Both policies retain explicitly identified expensive operations while
+        # recomputing the surrounding inexpensive work.
+        traced_trainer.config.compile.memory_policy = "default"
 
         # Warm up both paths so allocator and one-time tracing setup do not skew
         # the measured peak memory.
@@ -183,7 +189,7 @@ class TestGraphSACPeakMemory(unittest.TestCase):
         FullAC.Config().build().apply(eager_model)
         eager_trainer = build_minimal_trainer(
             eager_model,
-            llama3_registry(DEBUGMODEL),
+            build_llama3_model_config(DEBUGMODEL),
             Trainer,
             parallelism_context=self.parallelism_context,
         )
@@ -192,7 +198,7 @@ class TestGraphSACPeakMemory(unittest.TestCase):
         traced_model.load_state_dict(copy.deepcopy(self.state_dict))
         traced_trainer = build_minimal_trainer(
             traced_model,
-            llama3_registry(DEBUGMODEL),
+            build_llama3_model_config(DEBUGMODEL),
             GraphTrainer,
             activation_checkpoint_mode="selective",
             parallelism_context=self.parallelism_context,

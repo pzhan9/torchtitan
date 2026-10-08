@@ -7,29 +7,21 @@
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Annotated, Any, cast
+from functools import partial
+from typing import Any, cast, NamedTuple, TYPE_CHECKING, TypeAlias
 
 import spmd_types as spmd
 import torch
 import torch.distributed.checkpoint.stateful
-import tyro
+from torch.distributed.fsdp import FSDPModule
 
 from torchtitan.components.checkpointer import BaseCheckpointManager, CheckpointManager
 from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper
-from torchtitan.components.optimizer import (
-    EMA,
-    LRSchedulersContainer,
-    OptimizersContainer,
-)
+from torchtitan.components.optim import Optim
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
-from torchtitan.config.configs import (
-    CommConfig,
-    CompileConfig,
-    DebugConfig,
-    TrainingConfig,
-)
+from torchtitan.config.configs import CommConfig, DebugConfig, TrainingConfig
 from torchtitan.config.override import OverrideConfig
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed import ParallelismContext, utils as dist_utils
@@ -37,13 +29,14 @@ from torchtitan.distributed.activation_checkpoint import (
     ActivationCheckpointingConfig,
     SelectiveAC,
 )
+from torchtitan.distributed.batch_invariant import set_batch_invariance
 from torchtitan.distributed.cuda_graph import (
     cuda_graph_teardown,
     cuda_graphs_supported,
-    run_eager_on_cuda_graph_stream,
+    NUM_CUDA_GRAPH_WARMUP_STEPS,
+    wrap_fwd_bwd_with_cuda_graph,
     wrap_with_cuda_graph,
 )
-from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.metrics import (
     build_device_memory_monitor,
@@ -51,55 +44,95 @@ from torchtitan.observability.metrics import (
     DeviceMemStats,
 )
 from torchtitan.observability.profiler import Profiler
-from torchtitan.observability.sdc_replayer import ScalarStateAccessor, SDCReplayer
+from torchtitan.observability.sdc_replayer import SDCReplayer
 from torchtitan.protocols import BaseModel
 from torchtitan.quantization.utils import has_quantization
 from torchtitan.tools import utils
+from torchtitan.tools.garbage_collector import GarbageCollector
+
+
+if TYPE_CHECKING:
+    from torchtitan.models.common.dist_moe.runtime import DistMoeRuntime
 
 
 logger = logging.getLogger(__name__)
 
-_NUM_CUDA_GRAPH_WARMUP_STEPS = 2
+
+class ForwardBackwardResult(NamedTuple):
+    loss: torch.Tensor
+    loss_metrics: list[dict[str, torch.Tensor]]
+
+
+_ForwardBackwardFn: TypeAlias = Callable[
+    [list[tuple[Any, ...]], torch.Tensor], ForwardBackwardResult
+]
 
 
 class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Stateful):
     """Shared distributed training engine.
 
     A microbatch is one data-parallel-rank-local forward/backward input. A
-    microbatch group is one gradient-accumulation unit: it contains one
-    microbatch without pipeline parallelism and all pipeline microbatches for
-    one schedule step with pipeline parallelism. One or more microbatch groups
-    contribute to each optimizer step.
+    microbatch group contains one microbatch without pipeline parallelism and
+    all pipeline microbatches for one schedule step with pipeline parallelism.
+    One or more microbatch groups contribute to each optimizer step.
+
+    Forward and backward calls follow this flow::
+
+        TrainingEngine.initialize
+        |
+        +-- _initialize_forward_backward
+
+        Trainer.train_step
+        |
+        +-- TrainingEngine.forward_backward
+            |
+            +-- _preprocess_microbatch_groups
+            |
+            +-- _run_forward_backward =
+                _forward_backward_body (maybe_wrapped_with_cuda_graph)
+                |
+                +-- _pp_forward_backward_microbatch_group
+                |
+                +-- _non_pp_forward_backward_microbatch
+
+        Trainer.train_step
+        |
+        +-- TrainingEngine.optim_step
+            |
+            +-- Optim.step
+                |
+                +-- _update (maybe_wrapped_with_cuda_graph)
+                +-- lr_schedulers.step
+                +-- ema.step
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        optimizer: OptimizersContainer.Config = field(
-            default_factory=OptimizersContainer.Config
-        )
-        lr_scheduler: LRSchedulersContainer.Config = field(
-            default_factory=LRSchedulersContainer.Config
-        )
-        ema: EMA.Config | None = None
-        """Online EMA of model weights, e.g. for cheap mid-WSD-training eval
-        without a full LR decay. Unset (None) means EMA is disabled."""
+        optim: Optim.Config = field(default_factory=Optim.Config)
         training: TrainingConfig = field(default_factory=TrainingConfig)
+        garbage_collector: GarbageCollector.Config = field(
+            default_factory=GarbageCollector.Config
+        )
         parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
-        checkpointer: Annotated[
-            CheckpointManager.Config | None, tyro.conf.AvoidSubcommands
-        ] = None
+        checkpointer: CheckpointManager.Config | None = None
         activation_checkpoint: ActivationCheckpointingConfig = field(
             default_factory=SelectiveAC.Config
         )
         profiler: Profiler.Config = field(default_factory=Profiler.Config)
-        # Suppressed because replay is enabled programmatically in recipes.
-        sdc_replayer: Annotated[SDCReplayer.Config | None, tyro.conf.Suppress] = None
+        sdc_replayer: SDCReplayer.Config | None = None
         comm: CommConfig = field(default_factory=CommConfig)
         debug: DebugConfig = field(default_factory=DebugConfig)
         override: OverrideConfig = field(default_factory=OverrideConfig)
         loss: BaseLoss.Config = field(default_factory=BaseLoss.Config)
+        dist_moe: Configurable.Config | None = None
+        """Optional rank-wide Dist-MoE memory and pipeline-slot policy."""
 
         def __post_init__(self) -> None:
+            if (
+                self.dist_moe is not None
+                and self.training.mixed_precision_param != "bfloat16"
+            ):
+                raise ValueError("Dist-MoE requires mixed_precision_param='bfloat16'")
             if (
                 self.debug.spmd_typechecking
                 and self.parallelism.pipeline_parallel_degree > 1
@@ -108,13 +141,39 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 raise ValueError(
                     "SPMD typechecking is not supported with pipeline parallelism. "
                     "Validate the same config without PP "
-                    "(--parallelism.pipeline_parallel_degree 1)."
+                    "(parallelism.pipeline_parallel_degree=1)."
+                )
+
+            if (
+                self.training.enable_cpu_offload
+                and "dp_shard" not in self.debug.distinct_seed_mesh_axes
+            ):
+                raise ValueError(
+                    "training.enable_cpu_offload requires 'dp_shard' in "
+                    "debug.distinct_seed_mesh_axes; otherwise every FSDP shard "
+                    "is initialized with the same CPU RNG stream."
                 )
 
             if self.parallelism.num_pp_microbatches <= 0:
                 raise ValueError(
                     "parallelism.num_pp_microbatches must be greater than 0."
                 )
+            if self.optim.enable_cuda_graph and self.training.disable_cuda_graphs:
+                raise ValueError(
+                    "The optimization CUDA graph requires CUDA graphs to be enabled."
+                )
+            if self.training.cuda_graph_per_accumulation_group:
+                if self.training.disable_cuda_graphs:
+                    raise ValueError(
+                        "Per-group CUDA graphs require CUDA graphs to be enabled."
+                    )
+                if self.sdc_replayer is not None:
+                    raise ValueError("Per-group CUDA graphs do not support SDC replay.")
+                if self.parallelism.fsdp_defer_gradient_reduction:
+                    raise ValueError(
+                        "Per-group CUDA graphs require "
+                        "parallelism.fsdp_defer_gradient_reduction=False."
+                    )
             num_tokens = self.training.num_tokens_per_microbatch_per_dp_rank
             sequence_parallel_degree = (
                 self.parallelism.tensor_parallel_degree
@@ -155,9 +214,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     model_config: BaseModel.Config
     output_dir: str
     loss_fn: BaseLoss
-    optimizers: OptimizersContainer
-    lr_schedulers: LRSchedulersContainer
-    ema: EMA | None
+    optim: Optim
     checkpointer: BaseCheckpointManager
     pp_has_last_stage: bool
     max_num_documents: int | None
@@ -168,10 +225,13 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     model_param_count: int
     num_flops_per_token: int
     has_quantization: bool
-    loss_is_finite: torch.Tensor
+    loss: torch.Tensor
     loss_metrics: dict[str, torch.Tensor]
     device_memory_monitor: DeviceMemoryMonitor
     model_device_mem_stats: DeviceMemStats
+    _run_forward_backward: _ForwardBackwardFn
+    _cuda_graph_per_accumulation_group_enabled: bool
+    _dist_moe_runtime: "DistMoeRuntime | None"
 
     def __init__(
         self,
@@ -191,8 +251,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.num_accumulation_steps = 1
         self.num_completed_steps = 0
         self.ntokens_seen = 0
-        self._num_optimizer_steps_since_cuda_graph_init = 0
         self.sdc_replayer = None
+        self._cuda_graph_per_accumulation_group_enabled = False
+        self._dist_moe_runtime = None
         self.preprocess_inputs_kwargs: dict[str, Any] = {}
         self.loss_metrics = {}
         self._initialize_distributed_runtime()
@@ -205,7 +266,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
         config = self.config
-        dist_utils.set_batch_invariance(config.debug.batch_invariant)
+        set_batch_invariance(config.debug.batch_invariant)
         with sl.log_trace_span("torch_distributed_init"):
             topology = dist_utils.init_distributed(
                 config.comm,
@@ -214,17 +275,14 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 pipeline_parallel_degree=config.parallelism.pipeline_parallel_degree,
             )
         self.parallelism_context = ParallelismContext.from_config(
-            config.parallelism, topology
+            config.parallelism, topology, dump_folder=self.output_dir
         )
-        self.gc_handler = utils.GarbageCollection(
-            gc_freq=config.training.gc_freq,
-            debug=config.training.gc_debug,
-        )
+        self.garbage_collector = config.garbage_collector.build()
         dist_utils.set_determinism(
             self.parallelism_context,
             self.device,
-            self.config.debug,
-            distinct_seed_mesh_axes=["pp"],
+            config.debug,
+            distinct_seed_mesh_axes=config.debug.distinct_seed_mesh_axes,
         )
         self.device_memory_monitor = build_device_memory_monitor()
 
@@ -232,34 +290,33 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     def initialize(
         self,
         *,
-        compile_config: CompileConfig | None,
         hf_assets_path: str,
         dataloader: BaseDataLoader | None = None,
         create_seed_checkpoint: bool = False,
     ) -> None:
         """Initialize model execution and the state required to train it."""
         self._initialize_model(
-            compile_config=compile_config,
             hf_assets_path=hf_assets_path,
             create_seed_checkpoint=create_seed_checkpoint,
         )
         self.model_device_mem_stats = self.device_memory_monitor.get_peak_stats()
-        self._initialize_optimizer()
+        self._initialize_optim()
         self._initialize_checkpointer(
             dataloader=dataloader,
             sd_adapter=self.state_dict_adapter,
         )
+        if create_seed_checkpoint:
+            return
         self._initialize_forward_backward()
 
     def _initialize_model(
         self,
         *,
-        compile_config: CompileConfig | None,
         hf_assets_path: str,
         create_seed_checkpoint: bool = False,
     ) -> None:
         """Build the loss and model execution state."""
-        self.loss_fn = self.config.loss.build(compile_config=compile_config)
+        self.loss_fn = self.config.loss.build()
         if create_seed_checkpoint:
             init_device = "cpu"
             buffer_device = None
@@ -271,6 +328,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             buffer_device = None
 
         with (
+            self.parallelism_context.activate_spmd(),
             torch.device("meta"),
             utils.set_default_dtype(TORCH_DTYPE_MAP[self.config.training.dtype]),
         ):
@@ -299,12 +357,12 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 parallelism_context=self.parallelism_context,
                 training=config.training,
                 parallelism=config.parallelism,
-                compile_config=compile_config,
                 ac_config=config.activation_checkpoint,
                 dump_folder=self.output_dir,
                 device=self.device,
                 model_config=self.model_config,
                 loss_fn=self.loss_fn,
+                **self._parallelize_compile_kwargs(),
             )
             del model
         else:
@@ -313,9 +371,9 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                     parallelism_context=self.parallelism_context,
                     training=config.training,
                     parallelism=config.parallelism,
-                    compile_config=compile_config,
                     ac_config=config.activation_checkpoint,
                     dump_folder=self.output_dir,
+                    **self._parallelize_compile_kwargs(),
                 )
             self.model_parts = [model]
             self.pp_has_first_stage = True
@@ -350,22 +408,29 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             f"{self.model_param_count:,} total parameters"
         )
 
-    def _initialize_optimizer(self) -> None:
-        """Construct optimizers, learning-rate schedulers and the weight EMA."""
-        self.optimizers = self.config.optimizer.build(model_parts=self.model_parts)
+    def _parallelize_compile_kwargs(self) -> dict[str, Any]:
+        """Return the compile kwargs ``model.parallelize``/``model.pipeline`` expect for this engine's models.
+
+        Regular models expect ``local_compile_regions`` (compiled regions); GraphTrainer overrides this to
+        return ``compile_config`` (whole-step compile).
+        """
+        # TODO: apply local compile outside parallelize/pipeline (#5026 review). That needs
+        # GraphTrainer to stop reading its compile config there first (apply_compile,
+        # EP-overlap chunking, enable_autoparallel, GraphPP runtime); then delete this hook.
+        return {"local_compile_regions": self.model_config.local_compile_regions}
+
+    def _initialize_optim(self) -> None:
+        """Construct the parameter update and its state."""
+        self.optim = self.config.optim.build(
+            model_parts=self.model_parts,
+            parallelism_context=self.parallelism_context,
+            training_steps=self.config.training.steps,
+            pp_has_last_stage=self.pp_has_last_stage,
+        )
         self.model_cls._register_optimizer_hooks(
-            self.optimizers,
+            self.optim.optimizers,
             self.model_parts,
             self.parallelism_context,
-        )
-        self.lr_schedulers = self.config.lr_scheduler.build(
-            optimizers=self.optimizers,
-            training_steps=self.config.training.steps,
-        )
-        self.ema = (
-            self.config.ema.build(model_parts=self.model_parts)
-            if self.config.ema is not None
-            else None
         )
 
     def _initialize_checkpointer(
@@ -381,226 +446,276 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.checkpointer = checkpointer_config.build(
             dataloader=dataloader,
             model_parts=self.model_parts,
-            optimizers=self.optimizers,
-            lr_schedulers=self.lr_schedulers,
-            ema=self.ema,
+            optimizers=self.optim.optimizers,
+            lr_schedulers=self.optim.lr_schedulers,
+            ema=self.optim.ema,
             states={"train_state": self},
             sd_adapter=sd_adapter,
             base_folder=self.output_dir,
         )
 
     def _initialize_forward_backward(self) -> None:
-        """Build SDC replay and select PP/eager or CUDA graph execution."""
+        """Build SDC replay and the gradient accumulation execution path."""
+        if self.config.dist_moe is not None:
+            self._dist_moe_runtime = self.config.dist_moe.build(
+                model_parts=self.model_parts,
+                parallelism_context=self.parallelism_context,
+                device=self.device,
+                num_tokens_per_microbatch_per_dp_rank=(
+                    self.config.training.num_tokens_per_microbatch_per_dp_rank
+                ),
+                pp_schedule=(
+                    self.pp_schedule if self.parallelism_context.pp_enabled else None
+                ),
+            )
+
         sdc_config = self.config.sdc_replayer
         self.sdc_replayer = None
         if sdc_config is not None:
             self.sdc_replayer = sdc_config.build(
                 modules=self.model_parts,
                 device=self.device,
-                scalar_state={
-                    "ntokens_seen": ScalarStateAccessor(
-                        get=lambda: self.ntokens_seen,
-                        set=lambda value: setattr(self, "ntokens_seen", value),
-                    )
-                },
             )
 
-        self._num_optimizer_steps_since_cuda_graph_init = 0
         if self.parallelism_context.pp_enabled:
-            self.forward_backward_body_fn = cast(
-                Callable[..., torch.Tensor], self._pp_forward_backward_body
-            )
             self._pp_loss_sentinel_on_non_last_stage = torch.full(
                 (1,), -1.0, device=self.device
             )
+
+        eager_forward_backward_fn = partial(
+            self._forward_backward_body,
+            defer_fsdp_gradient_reduction=(
+                self.config.parallelism.fsdp_defer_gradient_reduction
+            ),
+        )
+        self._run_forward_backward = eager_forward_backward_fn
+        if self.config.training.disable_cuda_graphs or not cuda_graphs_supported():
+            return
+
+        if self.config.training.cuda_graph_per_accumulation_group:
+            graph_group_runner = wrap_with_cuda_graph(
+                eager_forward_backward_fn,
+                num_warmup_iterations=NUM_CUDA_GRAPH_WARMUP_STEPS,
+            )
+
+            # TODO: Use multiple CUDA graphs to support variable group counts
+            # without duplicating the gradient accumulation logic.
+            def run_forward_backward_groups(
+                microbatch_groups: list[tuple[Any, ...]],
+                global_loss_token_counts: torch.Tensor,
+            ) -> ForwardBackwardResult:
+                accumulated_loss: torch.Tensor | None = None
+                loss_metrics: list[dict[str, torch.Tensor]] = []
+                for microbatch_group in microbatch_groups:
+                    result = graph_group_runner(
+                        [microbatch_group],
+                        global_loss_token_counts,
+                    )
+                    group_loss = result.loss.clone()
+                    if accumulated_loss is None:
+                        accumulated_loss = group_loss
+                    else:
+                        accumulated_loss.add_(group_loss)
+                    loss_metrics.extend(
+                        {key: value.clone() for key, value in group_metrics.items()}
+                        for group_metrics in result.loss_metrics
+                    )
+                assert accumulated_loss is not None
+                return ForwardBackwardResult(accumulated_loss, loss_metrics)
+
+            self._cuda_graph_per_accumulation_group_enabled = True
+            self._run_forward_backward = run_forward_backward_groups
+            return
+
+        self._run_forward_backward = wrap_fwd_bwd_with_cuda_graph(
+            eager_forward_backward_fn,
+            parameters=(
+                parameter
+                for model_part in self.model_parts
+                for parameter in model_part.parameters()
+            ),
+            num_warmup_iterations=NUM_CUDA_GRAPH_WARMUP_STEPS,
+        )
+
+    @sl.log_trace_span("forward_backward")
+    def forward_backward(
+        self,
+        *,
+        microbatch_groups: list[list[TrainingMicrobatch]],
+        global_loss_token_counts: int | torch.Tensor,
+        global_routing_token_counts: torch.Tensor,
+    ) -> ForwardBackwardResult:
+        """Run all microbatch groups for one optimizer update."""
+        if not microbatch_groups:
+            raise ValueError("microbatch_groups must not be empty.")
+        self.num_accumulation_steps = len(microbatch_groups)
+        self.garbage_collector.run(self.num_completed_steps + 1)
+        self.optim.zero_grad(
+            set_to_none=not self._cuda_graph_per_accumulation_group_enabled
+        )
+        preprocessed_microbatch_groups = self._preprocess_microbatch_groups(
+            microbatch_groups
+        )
+        global_loss_token_counts = torch.as_tensor(
+            global_loss_token_counts, device=self.device
+        )
+        global_routing_token_counts = global_routing_token_counts.to(self.device)
+        for prepared_group in preprocessed_microbatch_groups:
+            model_kwargs_collection = (
+                prepared_group[1] if len(prepared_group) == 3 else (prepared_group[2],)
+            )
+            for model_kwargs in model_kwargs_collection:
+                if "aux_loss_denominators" in model_kwargs:
+                    model_kwargs["aux_loss_denominators"] = global_routing_token_counts
+
+        if self.sdc_replayer is not None:
+            result = self.sdc_replayer.run_fwd_bwd(
+                partial(
+                    self._run_forward_backward,
+                    preprocessed_microbatch_groups,
+                    global_loss_token_counts,
+                ),
+                step=self.num_completed_steps + 1,
+                get_loss=lambda result: result.loss,
+            )
         else:
-            self.forward_backward_body_fn = cast(
-                Callable[..., torch.Tensor], self._non_pp_forward_backward_body
+            result = self._run_forward_backward(
+                preprocessed_microbatch_groups,
+                global_loss_token_counts,
             )
 
-        if not self.config.training.disable_cuda_graphs:
-            eager_forward_backward_body_fn = self.forward_backward_body_fn
-            cuda_graph_forward_backward_body_fn = wrap_with_cuda_graph(
-                eager_forward_backward_body_fn
-            )
+        self.loss = result.loss
+        return result
 
-            if (
-                cuda_graph_forward_backward_body_fn
-                is not eager_forward_backward_body_fn
-            ):
-
-                def run_with_cuda_graph(**kwargs: Any) -> torch.Tensor:
-                    # Count complete optimizer steps instead of forward/backward
-                    # calls: accumulation and SDC replay can produce a variable
-                    # call count.
-                    if (
-                        self._num_optimizer_steps_since_cuda_graph_init
-                        < _NUM_CUDA_GRAPH_WARMUP_STEPS
-                    ):
-                        return run_eager_on_cuda_graph_stream(
-                            eager_forward_backward_body_fn, **kwargs
-                        )
-                    return cuda_graph_forward_backward_body_fn(**kwargs)
-
-                self.forward_backward_body_fn = run_with_cuda_graph
-
-    @sl.log_trace_span("prepare_step")
-    def prepare_step(
+    def _preprocess_microbatch_groups(
         self,
-        global_valid_tokens: int | torch.Tensor,
-        *,
-        num_accumulation_steps: int = 1,
-    ) -> torch.Tensor:
-        """Prepare one optimizer step and record its accumulation plan."""
-        if num_accumulation_steps < 1:
-            raise ValueError("num_accumulation_steps must be greater than 0.")
-        self.num_accumulation_steps = num_accumulation_steps
-        self.gc_handler.run(self.num_completed_steps + 1)
-        self.optimizers.zero_grad(set_to_none=self.config.training.disable_cuda_graphs)
-        if isinstance(global_valid_tokens, int):
-            global_valid_tokens = torch.tensor(
-                global_valid_tokens,
-                dtype=torch.int64,
-                device=self.device,
-            )
-        # TODO(sdmyzlp): Each MTP depth can have a different valid-token count
-        # after shifting and should use its own auxiliary-loss denominator.
-        AuxLoss.set_step_denominator(global_valid_tokens)
-        return global_valid_tokens
-
-    @sl.log_trace_span("forward_backward_microbatch")
-    def forward_backward_microbatch(
-        self,
-        *,
-        microbatch_group: list[TrainingMicrobatch],
-        global_valid_tokens: torch.Tensor,
-        accumulation_index: int = 0,
-    ) -> torch.Tensor:
-        """Preprocess and execute one gradient-accumulation unit.
-
-        A microbatch group forms one complete PP step. Without PP, the group
-        contains exactly one data-parallel-rank-local microbatch.
-
-        Args:
-            microbatch_group: Microbatches forming one complete pipeline step.
-            global_valid_tokens: Valid-token count used to normalize the loss.
-            accumulation_index: Index of this gradient-accumulation unit.
-
-        Returns:
-            The detached loss for this gradient-accumulation unit.
-        """
-        if accumulation_index == 0:
-            # int32 is supported by NCCL reductions, unlike bool.
-            self.loss_is_finite = torch.ones((), dtype=torch.int32, device=self.device)
-
-        # HSDP replicate all-reduce is a no-op until the last accum group.
-        # Do not toggle under CUDA graphs when accum > 1: the graph is
-        # captured on the first group and replayed for later groups.
-        if self.parallelism_context.dp_replicate_enabled and (
-            self.num_accumulation_steps == 1 or self.config.training.disable_cuda_graphs
-        ):
-            is_last = accumulation_index == self.num_accumulation_steps - 1
-            for part in self.model_parts:
-                part.set_requires_all_reduce(is_last)  # pyrefly: ignore[not-callable]
-
-        def forward_backward() -> torch.Tensor:
-            if self.parallelism_context.pp_enabled:
-                if any(microbatch.loss_kwargs() for microbatch in microbatch_group):
-                    raise ValueError(
-                        "Per-microbatch loss arguments are not supported with "
-                        "pipeline parallelism yet."
+        microbatch_groups: list[list[TrainingMicrobatch]],
+    ) -> list[tuple[Any, ...]]:
+        """Preprocess all microbatch groups outside CUDA capture."""
+        preprocessed_microbatch_groups: list[tuple[Any, ...]] = []
+        for microbatch_group in microbatch_groups:
+            prepared_microbatches: list[tuple[Any, ...]] = []
+            for microbatch in microbatch_group:
+                with (
+                    sl.log_trace_span("preprocess_inputs"),
+                    self.parallelism_context.activate_spmd(),
+                ):
+                    inputs, labels, model_kwargs = self.model_parts[
+                        0
+                    ].preprocess_inputs(
+                        microbatch.to_input_dict(self.device, non_blocking=True),
+                        parallelism_context=self.parallelism_context,
+                        parallelism=self.config.parallelism,
+                        max_num_documents=self.max_num_documents,
+                        max_context_length=self.config.training.max_context_length,
+                        **self.preprocess_inputs_kwargs,
                     )
-                arg_mbs: list[tuple[torch.Tensor, ...]] = []
-                kwarg_mbs: list[dict[str, Any]] = []
-                target_mbs: list[torch.Tensor] | None = (
-                    [] if self.pp_has_last_stage else None
-                )
-                for microbatch in microbatch_group:
-                    input_dict = microbatch.to_input_dict(
-                        self.device, non_blocking=True
-                    )
-                    with (
-                        sl.log_trace_span("preprocess_inputs"),
-                        self.parallelism_context.activate_spmd(),
-                    ):
-                        inputs_mb, labels_mb, extra_kwargs_mb = self.model_parts[
-                            0
-                        ].preprocess_inputs(
-                            input_dict,
-                            parallelism_context=self.parallelism_context,
-                            parallelism=self.config.parallelism,
-                            max_num_documents=self.max_num_documents,
-                            max_context_length=(
-                                self.config.training.max_context_length
-                            ),
-                            **self.preprocess_inputs_kwargs,
-                        )
-                        assert isinstance(inputs_mb, torch.Tensor)
-                        assert isinstance(labels_mb, torch.Tensor)
-                        # Count logical input tokens instead of target elements:
-                        # model preprocessing can change the target shape, as in
-                        # Flux latent targets. CP shards the logical tokens.
-                        self.ntokens_seen += (
-                            self.config.training.num_tokens_per_microbatch_per_dp_rank
-                            // self.parallelism_context.cp
-                        )
-                    if self.pp_has_first_stage:
-                        arg_mbs.append((inputs_mb,))
-                    kwarg_mbs.append(extra_kwargs_mb)
-                    if target_mbs is not None:
-                        target_mbs.append(labels_mb)
-
-                return self.forward_backward_body_fn(
-                    inputs=arg_mbs if self.pp_has_first_stage else None,
-                    model_kwargs=kwarg_mbs,
-                    labels=target_mbs,
-                    loss_kwargs={"global_valid_tokens": global_valid_tokens},
-                )
-
-            assert len(microbatch_group) == 1
-            microbatch = microbatch_group[0]
-            input_dict = microbatch.to_input_dict(self.device, non_blocking=True)
-            with (
-                sl.log_trace_span("preprocess_inputs"),
-                self.parallelism_context.activate_spmd(),
-            ):
-                inputs, labels, extra_kwargs = self.model_parts[0].preprocess_inputs(
-                    input_dict,
-                    parallelism_context=self.parallelism_context,
-                    parallelism=self.config.parallelism,
-                    max_num_documents=self.max_num_documents,
-                    max_context_length=self.config.training.max_context_length,
-                    **self.preprocess_inputs_kwargs,
-                )
-                # Count logical input tokens instead of target elements: model
-                # preprocessing can change the target shape or structure, as in
-                # Flux latent targets and MTP label tuples. CP shards the tokens.
                 self.ntokens_seen += (
                     self.config.training.num_tokens_per_microbatch_per_dp_rank
                     // self.parallelism_context.cp
                 )
+                prepared_microbatches.append(
+                    (
+                        inputs,
+                        labels,
+                        model_kwargs,
+                        microbatch.to_loss_kwargs(self.device, non_blocking=True),
+                    )
+                )
 
-            return self.forward_backward_body_fn(
-                inputs=inputs,
-                labels=labels,
-                model_kwargs=extra_kwargs,
-                loss_kwargs={
-                    **microbatch.to_loss_kwargs(self.device, non_blocking=True),
-                    "global_valid_tokens": global_valid_tokens,
-                },
+            if not self.parallelism_context.pp_enabled:
+                assert len(prepared_microbatches) == 1
+                preprocessed_microbatch_groups.append(prepared_microbatches[0])
+                continue
+
+            if any(loss_kwargs for *_, loss_kwargs in prepared_microbatches):
+                raise ValueError(
+                    "Per-microbatch loss arguments are not supported with "
+                    "pipeline parallelism yet."
+                )
+            arg_mbs = (
+                [(inputs,) for inputs, *_ in prepared_microbatches]
+                if self.pp_has_first_stage
+                else None
+            )
+            kwarg_mbs = [
+                model_kwargs for _, _, model_kwargs, _ in prepared_microbatches
+            ]
+            target_mbs = (
+                [labels for _, labels, _, _ in prepared_microbatches]
+                if self.pp_has_last_stage
+                else None
+            )
+            preprocessed_microbatch_groups.append((arg_mbs, kwarg_mbs, target_mbs))
+        return preprocessed_microbatch_groups
+
+    def _forward_backward_body(
+        self,
+        microbatch_groups: list[tuple[Any, ...]],
+        global_loss_token_counts: torch.Tensor,
+        *,
+        defer_fsdp_gradient_reduction: bool,
+    ) -> ForwardBackwardResult:
+        """Run all microbatch groups in one graphable call."""
+
+        accumulated_loss: torch.Tensor | None = None
+        loss_metrics: list[dict[str, torch.Tensor]] = []
+        num_accumulation_steps = len(microbatch_groups)
+        for accumulation_index, prepared_inputs in enumerate(microbatch_groups):
+            is_last_accumulation_step = accumulation_index == num_accumulation_steps - 1
+
+            if self.parallelism_context.dp_replicate_enabled:
+                # All-reduce HSDP replicas only with the final accumulated gradient.
+                for model_part in self.model_parts:
+                    fsdp_root = cast(FSDPModule, model_part)
+                    fsdp_root.set_requires_all_reduce(is_last_accumulation_step)
+
+            self.loss_metrics = {}
+            if self.parallelism_context.pp_enabled:
+                arg_mbs, kwarg_mbs, target_mbs = prepared_inputs
+                # Finalization runs after the group's last PP microbatch.
+                loss = self._pp_forward_backward_microbatch_group(
+                    inputs=arg_mbs,
+                    model_kwargs=kwarg_mbs,
+                    labels=target_mbs,
+                    loss_kwargs={"global_loss_token_counts": global_loss_token_counts},
+                    finalize_gradients=(
+                        not defer_fsdp_gradient_reduction or is_last_accumulation_step
+                    ),
+                )
+            else:
+                if defer_fsdp_gradient_reduction:
+                    fsdp_root = cast(FSDPModule, self.model_parts[0])
+                    fsdp_root.set_is_last_backward(is_last_accumulation_step)
+                    fsdp_root.set_reshard_after_backward(is_last_accumulation_step)
+                    fsdp_root.set_requires_gradient_sync(is_last_accumulation_step)
+                inputs, labels, model_kwargs, loss_kwargs = prepared_inputs
+                loss = self._non_pp_forward_backward_microbatch(
+                    inputs=inputs,
+                    labels=labels,
+                    model_kwargs=model_kwargs,
+                    loss_kwargs={
+                        **loss_kwargs,
+                        "global_loss_token_counts": global_loss_token_counts,
+                    },
+                )
+
+            detached_loss = loss.detach()
+            if accumulated_loss is None:
+                accumulated_loss = detached_loss.clone()
+            else:
+                accumulated_loss.add_(detached_loss)
+            loss_metrics.append(
+                {
+                    key: value.detach().clone()
+                    for key, value in self.loss_metrics.items()
+                }
             )
 
-        if self.sdc_replayer is not None and accumulation_index == 0:
-            loss = self.sdc_replayer.run_fwd_bwd(
-                forward_backward, step=self.num_completed_steps + 1
-            )
-        else:
-            loss = forward_backward()
-        detached_loss = loss.detach()
-        self.loss_is_finite.logical_and_(torch.isfinite(detached_loss).all())
-        return detached_loss
+        assert accumulated_loss is not None
+        return ForwardBackwardResult(accumulated_loss, loss_metrics)
 
-    def _non_pp_forward_backward_body(
+    def _non_pp_forward_backward_microbatch(
         self,
         *,
         inputs: torch.Tensor | tuple[torch.Tensor, ...],
@@ -622,14 +737,20 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 loss.backward()
         return loss
 
-    def _pp_forward_backward_body(
+    def _pp_forward_backward_microbatch_group(
         self,
         *,
         inputs: list[tuple[torch.Tensor, ...]] | None,
         labels: list[torch.Tensor] | None,
         model_kwargs: list[dict[str, Any]],
         loss_kwargs: dict[str, Any],
+        finalize_gradients: bool = True,
     ) -> torch.Tensor:
+        """Run one PP microbatch group.
+
+        The input lists contain one pipeline schedule step. ``finalize_gradients``
+        controls whether that step finishes FSDP gradient reduction.
+        """
         with self.parallelism_context.activate_spmd(
             typechecking=self.config.debug.spmd_typechecking,
         ):
@@ -641,6 +762,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
                 losses=losses,
                 loss_kwargs=loss_kwargs,
                 return_outputs=False,
+                finalize_gradients=finalize_gradients,
             )
 
         if self.pp_has_last_stage:
@@ -650,50 +772,17 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             return torch.sum(torch.stack(detached_losses)).to(self.device)
         return self._pp_loss_sentinel_on_non_last_stage
 
-    @sl.log_trace_span("optimizer_step")
-    def optimizer_step(self) -> torch.Tensor:
-        """Validate gradients, then advance optimizer and learning-rate scheduler."""
+    @sl.log_trace_span("optim_step")
+    def optim_step(self) -> torch.Tensor:
+        """Run one optimization update and advance its eager state."""
         current_step = self.num_completed_steps + 1
-        grad_norm = dist_utils.clip_grad_norm_(
-            [p for model in self.model_parts for p in model.parameters()],
-            self.config.training.max_norm,
-            foreach=True,
-            pp_mesh=self.parallelism_context.get_optional_mesh("pp"),
-            ep_enabled=self.parallelism_context.ep_enabled,
-        )
-        if not self.parallelism_context.pp_enabled or self.pp_has_last_stage:
-            loss_mesh = self.parallelism_context.get_optional_mesh("loss")
-            if loss_mesh is not None:
-                torch.distributed.all_reduce(
-                    self.loss_is_finite,
-                    op=torch.distributed.ReduceOp.MIN,
-                    group=loss_mesh.get_group(),
-                )
-        pp_mesh = self.parallelism_context.get_optional_mesh("pp")
-        if pp_mesh is not None:
-            torch.distributed.all_reduce(
-                self.loss_is_finite,
-                op=torch.distributed.ReduceOp.MIN,
-                group=pp_mesh.get_group(),
-            )
-        step_is_finite = self.loss_is_finite.logical_and(
-            torch.isfinite(grad_norm).all()
-        )
-        torch._assert_async(
-            step_is_finite,
-            "Loss or gradient norm is not finite on at least one rank at "
-            f"step {current_step}. Stopping training before the optimizer update.",
-        )
         if hasattr(self, "checkpointer"):
             self.checkpointer.maybe_wait_for_staging()
-        self.optimizers.step()
-        self.lr_schedulers.step()
-        if self.ema is not None:
-            # current_step is the step just optimized, which is what the EMA
-            # schedule's start_step/update_every_n_steps are defined against.
-            self.ema.step(current_step)
+        grad_norm = self.optim.step(
+            self.loss,
+            current_step=current_step,
+        )
         self.num_completed_steps = current_step
-        self._num_optimizer_steps_since_cuda_graph_init += 1
         return grad_norm
 
     def state_dict(self) -> dict[str, Any]:
@@ -738,5 +827,8 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         self.close_profiler()
         if not self.config.training.disable_cuda_graphs:
             cuda_graph_teardown()
+        if self._dist_moe_runtime is not None:
+            self._dist_moe_runtime.close()
+            self._dist_moe_runtime = None
         if hasattr(self, "checkpointer"):
             self.checkpointer.close()

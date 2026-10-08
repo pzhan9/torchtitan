@@ -23,6 +23,7 @@ in order, and the pass registries.  Individual passes live in dedicated modules:
   shared region prologue extraction
 - ``selective_activation_remat.py`` — activation rematerialization
 - ``cpu_offload.py`` — CPU offload insertion
+- ``paged_stash_memory_policy.py`` — MoE paged stash insertion
 - ``custom_codegen.py`` — custom code generation for profiling/debugging
 """
 
@@ -53,18 +54,11 @@ from torchtitan.experiments.graph_trainer.debug_utils import (
     snapshot_graph,
     tlparse_log_graph_pass,
 )
-from torchtitan.experiments.graph_trainer.ep_chunk_pass import (
-    ep_overlap_chunk_pass,
-    populate_chunk_dim_metadata_pass,
-)
 from torchtitan.experiments.graph_trainer.ep_eager_chunk import (
     populate_eager_chunk_metadata_pass,
 )
 from torchtitan.experiments.graph_trainer.ep_overlap_pass import (
     ep_overlap_schedule_pass,
-)
-from torchtitan.experiments.graph_trainer.ep_pass_utils import (
-    concretize_ep_chunk_symbolic_shapes_pass,
 )
 from torchtitan.experiments.graph_trainer.ep_process_group_pass import (
     isolate_ep_process_group_pass,
@@ -76,6 +70,7 @@ from torchtitan.experiments.graph_trainer.fsdp_passes import (
     get_transformer_block_layer_ids,
     joint_transformer_block_bucketing_reordering_pass,
     reassign_collective_pgs_pass,
+    reorder_hsdp_grad_collectives_pass,
     schedule_fsdp_comms_to_dense_regions_pass,
 )
 from torchtitan.experiments.graph_trainer.inductor_passes import (
@@ -86,6 +81,9 @@ from torchtitan.experiments.graph_trainer.inductor_passes import (
 from torchtitan.experiments.graph_trainer.make_fx_tracer import TracedResult
 from torchtitan.experiments.graph_trainer.memory_policy import (
     tag_with_memory_policy_pass,
+)
+from torchtitan.experiments.graph_trainer.paged_stash_memory_policy import (
+    apply_paged_stash_pass,
 )
 from torchtitan.experiments.graph_trainer.remove_noop_passes import (
     canonicalize_graph_pass,
@@ -140,13 +138,6 @@ def async_tensor_parallel_pass(
     return gm
 
 
-def _tensor_parallel_degree(config, parallelism_context=None) -> int:
-    """Return TP degree from ``ParallelismContext`` when available, else config."""
-    if parallelism_context is not None and hasattr(parallelism_context, "tp"):
-        return int(parallelism_context.tp)
-    return int(getattr(config.parallelism, "tensor_parallel_degree", 1))
-
-
 def construct_mandatory_graph_passes() -> list[Callable]:
     """Return correctness passes that run even when optional passes are disabled."""
     return [remove_parameter_gradient_markers_pass]
@@ -173,7 +164,7 @@ def compile_time_passes(
     ``reassign_collective_pgs_pass`` runs just before bucketing to place
     collectives on dedicated process groups / streams (bucketing then inherits
     the new PGs). Disable with
-    ``--compile.disable_passes reassign_collective_pgs_pass``.
+    ``compile.disable_passes=["reassign_collective_pgs_pass"]``.
 
     ``include_inductor=False`` leaves the graph in FX form after the
     metadata-preserving passes. GraphPP uses that mode before it calls its
@@ -186,6 +177,7 @@ def compile_time_passes(
     from torchtitan.components.loss import ChunkedLossWrapper
     from torchtitan.experiments.graph_trainer.common_utils import (
         get_default_transformer_block_buckets,
+        get_simple_fsdp_mesh,
     )
 
     n_layers = len(config.model.layers)
@@ -200,14 +192,21 @@ def compile_time_passes(
     if parallelism_context is not None and hasattr(
         parallelism_context, "get_optional_mesh"
     ):
+        dp_replicate_degree = parallelism_context.dp_replicate
+        dp_shard_degree = parallelism_context.dp_shard
         edp_shard_mesh = parallelism_context.get_optional_mesh("edp_shard")
         edp_shard_degree = 1 if edp_shard_mesh is None else edp_shard_mesh.size()
     else:
-        dp_shard = max(1, getattr(config.parallelism, "data_parallel_shard_degree", 1))
+        dp_replicate_degree = getattr(
+            config.parallelism, "data_parallel_replicate_degree", 1
+        )
+        dp_shard_degree = getattr(config.parallelism, "data_parallel_shard_degree", 1)
         cp_degree = getattr(config.parallelism, "context_parallel_degree", 1)
         tp_degree = getattr(config.parallelism, "tensor_parallel_degree", 1)
         ep_degree = max(1, getattr(config.parallelism, "expert_parallel_degree", 1))
-        edp_shard_degree = max(1, (dp_shard * cp_degree * tp_degree) // ep_degree)
+        edp_shard_degree = max(
+            1, (max(1, dp_shard_degree) * cp_degree * tp_degree) // ep_degree
+        )
     module_bucket_plans = get_default_transformer_block_buckets(
         n_layers,
         chunked_loss_enabled=uses_chunked_loss,
@@ -224,50 +223,9 @@ def compile_time_passes(
                 deduplicate_fsdp_unshard_chains_pass,
             ]
         )
-    ep_overlap_chunk_passes: list[Callable] = []
     ep_overlap_module_fqn: str | None = None
-    ep_overlap_chunk_strategy: str | None = None
     if ep_overlap_enabled:
-        (
-            overlap_dim,
-            ep_overlap_chunk_strategy,
-            ep_overlap_module_fqn,
-        ) = validate_ep_overlap_config(config.compile.ep_overlap)
-        if (
-            ep_overlap_chunk_strategy == "graph"
-            and _tensor_parallel_degree(config, parallelism_context) > 1
-        ):
-            # After DTensor lowering, the FX graph contains physical TP-local
-            # tensors and TP/SP layout helpers. Splitting those values is not
-            # proven equivalent to eager DTensor-level chunking.
-            raise ValueError(
-                "Graph EP chunking does not support tensor_parallel_degree > 1. "
-                "Use tensor_parallel_degree=1 or eager chunking for this "
-                "configuration."
-            )
-        if ep_overlap_chunk_strategy == "eager":
-            ep_overlap_chunk_passes.append(populate_eager_chunk_metadata_pass)
-        if ep_overlap_chunk_strategy == "graph":
-            ep_overlap_chunk_passes.extend(
-                [
-                    functools.partial(
-                        populate_chunk_dim_metadata_pass,
-                        mode=overlap_dim,
-                    ),
-                    functools.partial(
-                        ep_overlap_chunk_pass,
-                        mode=overlap_dim,
-                        module_pattern=ep_overlap_module_fqn,
-                        num_static_inputs=traced_result.num_static_inputs,
-                        optimize_grad_live_out=not (
-                            config.compile.ep_overlap.disable_early_grad_accumulation
-                        ),
-                        require_all_to_all=(
-                            getattr(config.parallelism, "expert_parallel_degree", 1) > 1
-                        ),
-                    ),
-                ]
-            )
+        _, ep_overlap_module_fqn = validate_ep_overlap_config(config.compile.ep_overlap)
 
     passes.extend(
         [
@@ -281,12 +239,66 @@ def compile_time_passes(
                 defer_n_layers=config.compile.cpu_offload_defer_n_layers,
             ),
             selective_activation_remat_pass,
+            # Paged stash runs after CPU offload (the two claim disjoint nodes)
+            # and *after* remat. Remat duplicates recomputed forward ops in
+            # front of their backward consumers, and those duplicates read the
+            # stashed activation. Paging before remat would leave them pointing
+            # at the original, which would keep the padded tensor alive for
+            # backward and cancel the whole saving.
+            functools.partial(
+                apply_paged_stash_pass,
+                page_size=config.compile.paged_stash.page_size,
+                prefetch_lookahead=config.compile.paged_stash.prefetch_n_layers,
+            ),
         ]
     )
     if ep_overlap_enabled:
-        passes.extend(ep_overlap_chunk_passes)
+        passes.append(populate_eager_chunk_metadata_pass)
         passes.append(isolate_ep_process_group_pass)
         passes.append(eliminate_dead_code_pass)
+
+    if dp_replicate_degree > 1:
+        if parallelism_context is None and (
+            dp_shard_degree > 1 or dp_shard_degree == -1 or edp_shard_degree > 1
+        ):
+            logger.warning(
+                "Skipping HSDP collective reordering because the configured "
+                "process groups are unavailable"
+            )
+        elif parallelism_context is not None:
+            hsdp_process_group_pairs: list[tuple[str, int, str]] = []
+            dense_shard_mesh = get_simple_fsdp_mesh(parallelism_context)
+            if dense_shard_mesh.size() > 1:
+                dense_replicate_mesh = parallelism_context.get_mesh("dp_replicate")
+                hsdp_process_group_pairs.append(
+                    (
+                        dense_replicate_mesh.get_group().group_name,
+                        dense_shard_mesh.size(),
+                        dense_shard_mesh.get_group().group_name,
+                    )
+                )
+
+            sparse_hsdp_mesh = parallelism_context.get_optional_mesh(
+                ["dp_replicate", "edp_shard"]
+            )
+            if sparse_hsdp_mesh is not None:
+                sparse_replicate_mesh = sparse_hsdp_mesh["dp_replicate"]
+                sparse_shard_mesh = sparse_hsdp_mesh["edp_shard"]
+                hsdp_process_group_pairs.append(
+                    (
+                        sparse_replicate_mesh.get_group().group_name,
+                        sparse_shard_mesh.size(),
+                        sparse_shard_mesh.get_group().group_name,
+                    )
+                )
+
+            if hsdp_process_group_pairs:
+                passes.append(
+                    functools.partial(
+                        reorder_hsdp_grad_collectives_pass,
+                        hsdp_process_group_pairs=tuple(hsdp_process_group_pairs),
+                    )
+                )
 
     if config.compile.enable_fsdp_ag_rs_overlap:
         passes.append(reassign_collective_pgs_pass)
@@ -314,21 +326,12 @@ def compile_time_passes(
                 pair_first_token_exchange=ep_overlap_module_fqn == MOE_BLOCK_FQN,
             )
         )
-        passes.append(concretize_ep_chunk_symbolic_shapes_pass)
 
     enable_fsdp_dense_region_overlap = config.compile.enable_fsdp_dense_region_overlap
-    if (
-        enable_fsdp_dense_region_overlap
-        and ep_overlap_enabled
-        and (
-            ep_overlap_module_fqn != MOE_BLOCK_FQN
-            or ep_overlap_chunk_strategy != "graph"
-        )
-    ):
+    if enable_fsdp_dense_region_overlap and ep_overlap_enabled:
         warnings.warn(
-            "--compile.enable_fsdp_dense_region_overlap is ignored when "
-            "--compile.ep_overlap.enabled is set unless graph chunking is "
-            "applied to layers.*.moe. The dense FSDP scheduler can be used "
+            "compile.enable_fsdp_dense_region_overlap is ignored when "
+            "compile.ep_overlap.enabled is set. The dense FSDP scheduler can "
             "standalone when ep_overlap is disabled.",
             stacklevel=2,
         )
@@ -427,7 +430,7 @@ def final_inductor_compile_passes(
             passes.append(insert_kernel_annotations_pass)
     else:
         raise ValueError(
-            "--compile.inductor_compilation must be 'regional' or 'full', "
+            "compile.inductor_compilation must be 'regional' or 'full', "
             f"got {inductor_compilation!r}"
         )
     return passes
@@ -515,14 +518,11 @@ def apply_graph_passes(
         example_inputs: Example (fake) inputs matching the graph signature.
         passes: Ordered list of pass callables, each with signature
             ``(gm, example_inputs, **kwargs) -> gm``.
-        compile_config: Optional compile config. When provided and
-            ``debug_graph_passes`` is True, logs timing, op-count diffs,
-            and before/after graphs to tlparse for each pass.
+        compile_config: Optional compile config, used for ``disable_passes``.
         respect_disable_passes: Whether ``compile_config.disable_passes`` may
             remove passes from this invocation. GraphPP sets this to ``False``
             for mandatory pre-partition normalization.
     """
-    debug = compile_config is not None and compile_config.debug_graph_passes
     disable_patterns = (
         compile_config.disable_passes if compile_config is not None else []
     )
@@ -532,27 +532,25 @@ def apply_graph_passes(
     pass_list = "\n  ".join(f"{i}. {name}" for i, name in enumerate(pass_names, 1))
     logger.info(f"Applying {len(passes)} graph passes:\n  {pass_list}")
     all_passes_start = time.perf_counter()
-    tlparse_log_graph_pass(gm, graph_name="make_fx_graph_traced", debug=debug)
+    tlparse_log_graph_pass(gm, graph_name="make_fx_graph_traced")
     # Some passes intentionally change placeholder shape metadata. Keep the
     # pass-local fake inputs in sync so later compiler passes see the same
     # static/dynamic contract as the FX graph.
     pass_example_inputs = list(example_inputs)
     for pass_fn in passes:
         pass_name = _get_pass_name(pass_fn)
-        if debug:
-            tlparse_log_graph_pass(gm, graph_name=f"before_{pass_name}", debug=debug)
-            before_snapshot = snapshot_graph(gm)
-            start = time.perf_counter()
+        tlparse_log_graph_pass(gm, graph_name=f"before_{pass_name}")
+        before_snapshot = snapshot_graph(gm)
+        start = time.perf_counter()
         gm = pass_fn(gm, pass_example_inputs)
         assert isinstance(
             gm, torch.fx.GraphModule
         ), f"Pass {pass_name} returned {type(gm).__name__}, expected GraphModule"
-        if debug:
-            elapsed = time.perf_counter() - start
-            logger.info(f"Pass {pass_name} took {elapsed:.3f}s")
-            tlparse_log_graph_pass(gm, graph_name=f"after_{pass_name}", debug=debug)
-            after_snapshot = snapshot_graph(gm)
-            log_graph_diff(before_snapshot, after_snapshot, pass_name)
+        elapsed = time.perf_counter() - start
+        logger.info(f"Pass {pass_name} took {elapsed:.3f}s")
+        tlparse_log_graph_pass(gm, graph_name=f"after_{pass_name}")
+        after_snapshot = snapshot_graph(gm)
+        log_graph_diff(before_snapshot, after_snapshot, pass_name)
     all_passes_elapsed = time.perf_counter() - all_passes_start
     logger.info(f"All {len(passes)} graph passes took {all_passes_elapsed:.3f}s")
     return gm

@@ -5,57 +5,37 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
-from collections.abc import Iterator
+import sys
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 import torch
 
 from torchtitan.components.data.types import TrainingMicrobatch
+from torchtitan.config import TORCH_DTYPE_MAP
+from torchtitan.distributed import maybe_apply_numa_binding
 from torchtitan.distributed.cuda_graph import cuda_graph_teardown
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 from torchtitan.experiments.graph_trainer.graph_pp.pipeline import (
     make_spmd_graph_runtime,
 )
+from torchtitan.experiments.graph_trainer.graph_pp.runner import GraphRuntime
 from torchtitan.experiments.graph_trainer.memory_policy import (
     validate_memory_policy_config,
 )
-from torchtitan.experiments.graph_trainer.registry import (
-    POST_INIT_HOOKS,
-    PRE_TRAIN_STEP_HOOKS,
+from torchtitan.experiments.graph_trainer.paged_stash_memory_policy import (
+    build_paged_stash_runner,
+    PagedStashManager,
+    PagedStashRunner,
 )
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols import BaseModel
 from torchtitan.trainer import Trainer
-from torchtitan.training_engine import TrainingEngine
+from torchtitan.training_engine import ForwardBackwardResult, TrainingEngine
 
 
 logger = logging.getLogger(__name__)
-
-
-def _maybe_apply_numa_binding(device_index: int, device_type: str) -> None:
-    """Pin this process to the NUMA node of its GPU for local memory bandwidth.
-
-    On multi-NUMA machines (e.g. GB200 NVLink-C2C), pinned-memory allocations
-    that land on the GPU's local NUMA node get ~350 GB/s D2H bandwidth vs
-    ~120 GB/s cross-NUMA. Must run before any pinned memory is allocated.
-    """
-    if device_type != "cuda":
-        return
-    from torch.numa.binding import (
-        _maybe_apply_numa_binding_to_current_process,
-        AffinityMode,
-        NumaOptions,
-    )
-
-    _maybe_apply_numa_binding_to_current_process(
-        device_index=device_index,
-        numa_options=NumaOptions(
-            affinity_mode=AffinityMode.NODE,
-            should_fall_back_if_binding_fails=True,
-        ),
-    )
-    logger.info("NUMA binding applied for GPU %d", device_index)
 
 
 class GraphTrainingEngine(TrainingEngine):
@@ -65,6 +45,11 @@ class GraphTrainingEngine(TrainingEngine):
     such as RL training.
     """
 
+    # Set in ``_initialize_forward_backward`` only when paged stashing is
+    # enabled. Class-level, so engines without it -- including those a test
+    # harness builds without running initialization -- see it as disabled.
+    _paged_stash_runner: PagedStashRunner | None = None
+
     def __init__(
         self,
         config: "GraphTrainer.Config",
@@ -73,6 +58,14 @@ class GraphTrainingEngine(TrainingEngine):
         max_num_documents: int | None,
         output_dir: str,
     ) -> None:
+        if config.optim.enable_cuda_graph:
+            raise ValueError("Optim CUDA graphs are not supported with GraphTrainer.")
+        if model_config.local_compile_regions:
+            raise ValueError(
+                "GraphTrainer traces the whole step into one graph; set "
+                "model.local_compile_regions = [] "
+                f"(got {model_config.local_compile_regions})."
+            )
         validate_memory_policy_config(config.compile)
         super().__init__(
             config,
@@ -82,7 +75,48 @@ class GraphTrainingEngine(TrainingEngine):
         )
         self._pinned_pool_ctx = None
 
+    def _parallelize_compile_kwargs(self) -> dict[str, Any]:
+        """Return the compile kwargs ``model.parallelize``/``model.pipeline`` expect for this engine's models.
+
+        Regular models expect ``local_compile_regions`` (compiled regions); GraphTrainer overrides this to
+        return ``compile_config`` (whole-step compile).
+        """
+        # TODO: apply local compile outside parallelize/pipeline (#5026 review). That needs
+        # GraphTrainer to stop reading its compile config there first (apply_compile,
+        # EP-overlap chunking, enable_autoparallel, GraphPP runtime); then delete this hook.
+        return {"compile_config": self.config.compile}
+
     def _initialize_forward_backward(self) -> None:
+        if self.config.parallelism.fsdp_defer_gradient_reduction:
+            raise ValueError(
+                "GraphTrainer does not support fsdp_defer_gradient_reduction."
+            )
+
+        if self.config.dist_moe is not None:
+            graph_runtime = None
+            if self.parallelism_context.pp_enabled:
+                graph_runtime = self.pp_schedule
+                assert isinstance(graph_runtime, GraphRuntime)
+            self._dist_moe_runtime = self.config.dist_moe.build(
+                model_parts=self.model_parts,
+                parallelism_context=self.parallelism_context,
+                device=self.device,
+                num_tokens_per_microbatch_per_dp_rank=(
+                    self.config.training.num_tokens_per_microbatch_per_dp_rank
+                ),
+                pp_schedule=(
+                    graph_runtime.pipeline_liveness_schedule
+                    if graph_runtime is not None
+                    else None
+                ),
+                set_forward_context=(
+                    graph_runtime.set_dist_moe_forward_context
+                    if graph_runtime is not None
+                    else None
+                ),
+                wgrad_dtype=TORCH_DTYPE_MAP[self.config.training.mixed_precision_param],
+            )
+
         if not self.parallelism_context.pp_enabled:
             num_tokens_per_train_step = self.config.training.num_tokens_per_train_step
             if num_tokens_per_train_step < 0:
@@ -100,10 +134,7 @@ class GraphTrainingEngine(TrainingEngine):
                 self.model_parts[0],
                 gradient_accumulation_steps=num_microbatches,
                 parallelism_context=self.parallelism_context,
-                parallelism=self.config.parallelism,
-                compile_config=self.config.compile,
                 device=self.device,
-                model_config=self.model_config,
                 loss_fn=self.loss_fn,
                 trainer_config=self.config,
             )
@@ -116,8 +147,36 @@ class GraphTrainingEngine(TrainingEngine):
             self.pp_has_last_stage = any(stage.is_last for stage in stages)
             assert self.pp_has_first_stage and self.pp_has_last_stage
 
-        super()._initialize_forward_backward()
-        _maybe_apply_numa_binding(self.device.index, self.device.type)
+        sdc_config = self.config.sdc_replayer
+        self.sdc_replayer = None
+        if sdc_config is not None:
+            self.sdc_replayer = sdc_config.build(
+                modules=self.model_parts,
+                device=self.device,
+            )
+
+        if self.parallelism_context.pp_enabled:
+            self._pp_loss_sentinel_on_non_last_stage = torch.full(
+                (1,), -1.0, device=self.device
+            )
+        self._run_forward_backward = partial(
+            self._forward_backward_body,
+            defer_fsdp_gradient_reduction=False,
+        )
+        if self.config.compile.memory_policy == "sac_and_paged_stash":
+            self._paged_stash_runner = build_paged_stash_runner(
+                self.config.compile.paged_stash,
+                optimizers=self.optim.optimizers,
+                model_parts=self.model_parts,
+                device=self.device,
+                pp_enabled=self.parallelism_context.pp_enabled,
+            )
+            self._run_forward_backward = partial(
+                self._page_stashed_forward_backward_body,
+                defer_fsdp_gradient_reduction=False,
+            )
+
+        maybe_apply_numa_binding(self.device.index, self.device.type)
 
         if self.config.compile.memory_policy == "sac_and_offload":
             from torch._functorch._activation_offloading.offload_ops import (
@@ -129,42 +188,28 @@ class GraphTrainingEngine(TrainingEngine):
         else:
             self._pinned_pool_ctx = None
 
-    def forward_backward_microbatch(
+    def _preprocess_microbatch_groups(
         self,
-        *,
-        microbatch_group: list[TrainingMicrobatch],
-        global_valid_tokens: torch.Tensor,
-        accumulation_index: int = 0,
-    ) -> torch.Tensor:
+        microbatch_groups: list[list[TrainingMicrobatch]],
+    ) -> list[tuple[Any, ...]]:
+        """Prepare GraphRuntime schedule inputs for AOT single-stage execution."""
         if self.parallelism_context.pp_enabled:
-            return super().forward_backward_microbatch(
-                microbatch_group=microbatch_group,
-                global_valid_tokens=global_valid_tokens,
-                accumulation_index=accumulation_index,
-            )
+            return super()._preprocess_microbatch_groups(microbatch_groups)
 
-        if any(microbatch.loss_kwargs() for microbatch in microbatch_group):
-            raise ValueError(
-                "Per-microbatch loss arguments are not supported with GraphRuntime yet."
-            )
+        preprocessed_microbatch_groups: list[tuple[Any, ...]] = []
+        for microbatch_group in microbatch_groups:
+            if any(microbatch.loss_kwargs() for microbatch in microbatch_group):
+                raise ValueError(
+                    "Per-microbatch loss arguments are not supported with "
+                    "GraphRuntime yet."
+                )
 
-        if accumulation_index == 0:
-            self.loss_is_finite = torch.ones((), dtype=torch.int32, device=self.device)
-
-        if self.parallelism_context.dp_replicate_enabled and (
-            self.num_accumulation_steps == 1 or self.config.training.disable_cuda_graphs
-        ):
-            is_last = accumulation_index == self.num_accumulation_steps - 1
-            for part in self.model_parts:
-                part.set_requires_all_reduce(is_last)  # pyrefly: ignore[not-callable]
-
-        def forward_backward() -> torch.Tensor:
             # Calling convention:
             # The runtime receives one positional tuple, keyword dictionary,
             # and target per schedule microbatch.
-            arg_mbs: list[tuple[torch.Tensor, ...]] = []
+            arg_mbs: list[tuple[torch.Tensor | tuple[torch.Tensor, ...], ...]] = []
             kwarg_mbs: list[dict[str, Any]] = []
-            target_mbs: list[torch.Tensor] = []
+            target_mbs: list[torch.Tensor | tuple[torch.Tensor, ...]] = []
             for microbatch in microbatch_group:
                 input_dict = microbatch.to_input_dict(self.device, non_blocking=True)
                 with (
@@ -181,8 +226,6 @@ class GraphTrainingEngine(TrainingEngine):
                         max_context_length=self.config.training.max_context_length,
                         **self.preprocess_inputs_kwargs,
                     )
-                    assert isinstance(inputs_mb, torch.Tensor)
-                    assert isinstance(labels_mb, torch.Tensor)
                     self.ntokens_seen += (
                         self.config.training.num_tokens_per_microbatch_per_dp_rank
                         // self.parallelism_context.cp
@@ -190,41 +233,82 @@ class GraphTrainingEngine(TrainingEngine):
                 arg_mbs.append((inputs_mb,))
                 kwarg_mbs.append(extra_kwargs_mb)
                 target_mbs.append(labels_mb)
+            preprocessed_microbatch_groups.append((arg_mbs, kwarg_mbs, target_mbs))
 
-            return self.forward_backward_body_fn(
-                inputs=arg_mbs,
-                model_kwargs=kwarg_mbs,
-                labels=target_mbs,
-                loss_kwargs={"global_valid_tokens": global_valid_tokens},
-            )
+        return preprocessed_microbatch_groups
 
-        if self.sdc_replayer is not None and accumulation_index == 0:
-            loss = self.sdc_replayer.run_fwd_bwd(
-                forward_backward, step=self.num_completed_steps + 1
-            )
-        else:
-            loss = forward_backward()
-        detached_loss = loss.detach()
-        self.loss_is_finite.logical_and_(torch.isfinite(detached_loss).all())
-        return detached_loss
-
-    def _non_pp_forward_backward_body(
+    def _forward_backward_body(
         self,
+        microbatch_groups: list[tuple[Any, ...]],
+        global_loss_token_counts: torch.Tensor,
         *,
-        inputs: Any,
-        labels: Any,
-        model_kwargs: Any,
-        loss_kwargs: dict[str, Any],
-    ) -> torch.Tensor:
-        """Route AOT PP=1 through the runtime body used by pipeline parallelism."""
-        return self._pp_forward_backward_body(
-            inputs=inputs,
-            labels=labels,
-            model_kwargs=model_kwargs,
-            loss_kwargs=loss_kwargs,
+        defer_fsdp_gradient_reduction: bool,
+    ) -> ForwardBackwardResult:
+        """Run microbatch groups through GraphRuntime."""
+        assert not defer_fsdp_gradient_reduction
+        accumulated_loss: torch.Tensor | None = None
+        loss_metrics: list[dict[str, torch.Tensor]] = []
+        for inputs, model_kwargs, labels in microbatch_groups:
+            self.loss_metrics = {}
+            loss = self._pp_forward_backward_microbatch_group(
+                inputs=inputs,
+                model_kwargs=model_kwargs,
+                labels=labels,
+                loss_kwargs={"global_loss_token_counts": global_loss_token_counts},
+                finalize_gradients=True,
+            )
+            detached_loss = loss.detach()
+            if accumulated_loss is None:
+                accumulated_loss = detached_loss.clone()
+            else:
+                accumulated_loss.add_(detached_loss)
+            loss_metrics.append(
+                {
+                    key: value.detach().clone()
+                    for key, value in self.loss_metrics.items()
+                }
+            )
+
+        assert accumulated_loss is not None
+        return ForwardBackwardResult(accumulated_loss, loss_metrics)
+
+    def _page_stashed_forward_backward_body(
+        self,
+        microbatch_groups: list[tuple[Any, ...]],
+        global_loss_token_counts: torch.Tensor,
+        *,
+        defer_fsdp_gradient_reduction: bool,
+    ) -> ForwardBackwardResult:
+        """``_forward_backward_body`` under the paged stash runner.
+
+        Wraps every microbatch group of the optimizer step rather than one
+        graph: the step's schedule is the unit that shares the stash buffers,
+        so it is also the unit an overflow verdict covers. Same placement as
+        Megatron's PagedStashRunner around forward_backward_func.
+        """
+        runner = self._paged_stash_runner
+        assert runner is not None
+        if self.parallelism_context.pp_enabled:
+            graph_runtime = self.pp_schedule
+            assert isinstance(graph_runtime, GraphRuntime)
+            runner.apply_pp_schedule(graph_runtime.pipeline_liveness_schedule)
+        return runner(
+            partial(
+                self._forward_backward_body,
+                microbatch_groups,
+                global_loss_token_counts,
+                defer_fsdp_gradient_reduction=defer_fsdp_gradient_reduction,
+            )
         )
 
     def close(self) -> None:
+        # A deferred overflow verdict for the final steps has no later step to
+        # observe it; drain it here so the job fails instead of exiting cleanly
+        # with steps that were silently skipped. Skipped when an exception is
+        # already unwinding, so it cannot mask the original error.
+        if self._paged_stash_runner is not None and sys.exc_info()[0] is None:
+            self._paged_stash_runner.final_overflow_check()
+
         if self._pinned_pool_ctx is not None:
             self._pinned_pool_ctx.__exit__(None, None, None)
             self._pinned_pool_ctx = None
@@ -233,6 +317,12 @@ class GraphTrainingEngine(TrainingEngine):
 
         cuda_graph_teardown()
 
+        # Free the stash buffers, now that no CUDA graph points into them, and
+        # leave any later trainer in this process a fresh manager.
+        if self._paged_stash_runner is not None:
+            self._paged_stash_runner = None
+            PagedStashManager.reset_instance()
+
 
 class GraphTrainer(Trainer):
     @dataclass(kw_only=True, slots=True)
@@ -240,6 +330,14 @@ class GraphTrainer(Trainer):
         compile: GraphTrainerCompileConfig = field(
             default_factory=GraphTrainerCompileConfig
         )
+        """Whole-step compile. GraphTrainer requires ``model.local_compile_regions`` to be empty."""
+
+        def __post_init__(self) -> None:
+            Trainer.Config.__post_init__(self)
+            if self.training.cuda_graph_per_accumulation_group:
+                raise ValueError(
+                    "Per-group CUDA graphs are not supported with GraphTrainer."
+                )
 
     engine_cls = GraphTrainingEngine
     engine: GraphTrainingEngine
@@ -252,10 +350,3 @@ class GraphTrainer(Trainer):
         ):
             self.num_pp_microbatches = self.engine.pp_schedule.num_microbatches
             self.gradient_accumulation_steps = 1
-        POST_INIT_HOOKS.get(self.config.compile.pass_pipeline, lambda _: None)(self)
-
-    def train_step(self, data_iterator: Iterator[TrainingMicrobatch]) -> None:
-        PRE_TRAIN_STEP_HOOKS.get(self.config.compile.pass_pipeline, lambda _: None)(
-            self
-        )
-        super().train_step(data_iterator)

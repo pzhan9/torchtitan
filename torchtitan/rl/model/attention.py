@@ -7,7 +7,9 @@
 import itertools
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
+
+import spmd_types as spmd
 
 import torch
 from torch.nn.attention import (
@@ -15,10 +17,12 @@ from torch.nn.attention import (
     current_flash_attention_impl,
 )
 from torch.nn.attention.varlen import AuxRequest
-from torchtitan.distributed.utils import is_in_batch_invariant_mode
-from torchtitan.models.common.attention import AttentionMasksType
+from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
+from torchtitan.models.common.attention import InnerAttention
+from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.observability.logging import warn_once
 from torchtitan.protocols.module import Module
+from torchtitan.protocols.sharding import ShardingConfig
 from torchtitan.tools.utils import get_cuda_flash_attention_impl
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
@@ -28,6 +32,10 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionImpl,
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
+)
+from vllm.v1.attention.backends.flash_attn_diffkv import (
+    FlashAttentionDiffKVBackend,
+    FlashAttentionDiffKVImpl,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
@@ -65,6 +73,22 @@ class TorchTitanVarlenInnerAttentionBackend(FlashAttentionBackend):
             _cudagraph_support = AttentionCGSupport.ALWAYS
 
         return TorchTitanVarlenInnerAttentionMetadataBuilder
+
+
+class TorchTitanVarlenInnerAttentionDiffKVBackend(FlashAttentionDiffKVBackend):
+    """PyTorch varlen backend using vLLM's unequal K/V cache support."""
+
+    @staticmethod
+    def get_name():
+        return "CUSTOM"
+
+    @staticmethod
+    def get_impl_cls():
+        return TorchTitanVarlenInnerAttentionDiffKVImpl
+
+    @staticmethod
+    def get_builder_cls():
+        return TorchTitanVarlenInnerAttentionBackend.get_builder_cls()
 
 
 class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
@@ -253,6 +277,26 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         return output[:num_actual_tokens]
 
 
+class TorchTitanVarlenInnerAttentionDiffKVImpl(TorchTitanVarlenInnerAttentionImpl):
+    """PyTorch varlen implementation using vLLM's unequal K/V cache writer."""
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        return FlashAttentionDiffKVImpl.do_kv_cache_update(
+            self, layer, key, value, kv_cache, slot_mapping
+        )
+
+
+class _VLLMAttention(Attention, Module):
+    """vLLM attention that participates in the TorchTitan Module protocol."""
+
+
 class VLLMAttentionWrapper(Module):
     """Adapter from TorchTitan tensor layout to ``vllm.Attention``.
 
@@ -268,20 +312,28 @@ class VLLMAttentionWrapper(Module):
     # global counter. The counter breaks with pipeline parallelism
     # where layers are built on different ranks.
     _layer_counter: itertools.count = itertools.count()
-    _module_protocol_exempt_children = frozenset({"vllm_attn"})
+    vllm_attn_scale_buffer_names: ClassVar[tuple[str, ...]] = (
+        "_k_scale",
+        "_prob_scale",
+        "_q_scale",
+        "_v_scale",
+    )
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
+        attention_metadata_key: type[InnerAttention]
         hidden_size: int
         num_heads: int
         num_kv_heads: int
         head_dim: int
+        value_head_dim: int | None = None
         scale: float | None = None
         sliding_window_size: int | None = None
         """Causal sliding-window size (``None`` => full attention)."""
 
     def __init__(self, config: Config) -> None:
         super().__init__()
+        self.attention_metadata_key = config.attention_metadata_key
 
         from vllm.config import get_current_vllm_config
 
@@ -310,12 +362,16 @@ class VLLMAttentionWrapper(Module):
         num_heads = num_heads // tp_degree
         num_kv_heads = num_kv_heads // tp_degree
         head_dim = config.head_dim
+        value_head_dim = (
+            config.value_head_dim if config.value_head_dim is not None else head_dim
+        )
         scale = config.scale if config.scale is not None else head_dim**-0.5
 
         self.hidden_size = config.hidden_size
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.value_head_dim = value_head_dim
         self.scale = scale
 
         cache_config = (
@@ -324,7 +380,14 @@ class VLLMAttentionWrapper(Module):
 
         # TODO: This need to be compatible with Pipeline Parallelism
         layer_id = next(VLLMAttentionWrapper._layer_counter)
-        self.vllm_attn = Attention(
+        diff_kv_kwargs: dict[str, Any] = {}
+        if value_head_dim != head_dim:
+            FlashAttentionDiffKVBackend.set_head_size_v(value_head_dim)
+            diff_kv_kwargs = {
+                "head_size_v": value_head_dim,
+                "attn_backend": TorchTitanVarlenInnerAttentionDiffKVBackend,
+            }
+        self.vllm_attn = _VLLMAttention(
             num_heads=num_heads,
             head_size=head_dim,
             scale=scale,
@@ -333,6 +396,15 @@ class VLLMAttentionWrapper(Module):
             quant_config=None,
             per_layer_sliding_window=config.sliding_window_size,
             prefix=f"model.layers.{layer_id}.attention.inner_attention",
+            **diff_kv_kwargs,
+        )
+        # Set sharding config for the inner vLLM attention module, which has scale
+        # buffers that need to be replicated on all ranks in the dense mesh
+        replicated_dense = dense_param_placement(tp=spmd.R)
+        self.vllm_attn._sharding_config = ShardingConfig(
+            state_shardings={
+                name: replicated_dense for name in self.vllm_attn_scale_buffer_names
+            },
         )
 
     def forward(
@@ -341,7 +413,7 @@ class VLLMAttentionWrapper(Module):
         k_THK: torch.Tensor,
         v_THV: torch.Tensor,
         *,
-        attention_masks: AttentionMasksType | None = None,
+        attention_metadata: None = None,
         **kwargs,
     ) -> torch.Tensor:
         """Run vLLM paged attention on local (non-DTensor) tensors.
@@ -352,19 +424,40 @@ class VLLMAttentionWrapper(Module):
             v_THV: ``(num_tokens, num_kv_heads, value_head_dim)``
 
         Returns:
-            ``(num_tokens, num_heads, head_dim)``.
+            ``(num_tokens, num_heads, value_head_dim)``.
         """
-        if attention_masks is not None:
+        if attention_metadata is not None:
             raise ValueError(
-                "VLLMAttentionWrapper does not support attention_masks; vLLM "
+                "VLLMAttentionWrapper does not support attention_metadata; vLLM "
                 "manages causal masking and the KV-cache internally."
             )
 
+        if self.value_head_dim != self.head_dim:
+            # V may be a strided view (e.g. MLA splits it from a fused per-head
+            # KV projection), but vLLM's cache writer assumes V heads are packed
+            # with stride value_head_dim, so repack before updating the cache.
+            v_THV = v_THV.contiguous()
         out_TD = self.vllm_attn(q_THK, k_THK, v_THV)
 
         # vLLM's flash attention backend may pad the token count (e.g.
         # round up to an even number), which introduces a new symbolic
         # shape under torch.compile.  Narrow to trim this padding.
-        num_tokens, _, head_dim = q_THK.shape
+        num_tokens = q_THK.shape[0]
         out_TD = out_TD.narrow(0, 0, num_tokens)
-        return out_TD.view(num_tokens, -1, head_dim)
+        return out_TD.view(num_tokens, -1, self.value_head_dim)
+
+
+def get_attention_dimensions(
+    attention_config, model_dim: int
+) -> tuple[int, int, int, int]:
+    """Return query heads, KV heads, Q/K head dim, and value head dim."""
+    num_heads = attention_config.n_heads
+    num_kv_heads = getattr(attention_config, "n_kv_heads", None) or num_heads
+    if hasattr(attention_config, "qk_nope_head_dim"):
+        head_dim = attention_config.qk_nope_head_dim + attention_config.qk_rope_head_dim
+        value_head_dim = attention_config.v_head_dim
+    else:
+        head_dim = getattr(attention_config, "head_dim", None)
+        head_dim = head_dim if head_dim is not None else model_dim // num_heads
+        value_head_dim = head_dim
+    return num_heads, num_kv_heads, head_dim, value_head_dim
