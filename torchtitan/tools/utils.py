@@ -5,16 +5,21 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
+import importlib.util
 import logging
 import os
 import subprocess
 from collections.abc import Generator
-from dataclasses import dataclass
 from types import ModuleType
 
 import torch
 from torch._utils import _get_available_device_type, _get_device_module
+from torch.nn.attention import (
+    activate_flash_attention_impl,
+    current_flash_attention_impl,
+)
 
+from torchtitan.observability.logging import warn_once
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +52,43 @@ def get_cuda_flash_attention_impl() -> str | None:
     # torch.compile there, so Hopper (sm90) stays on FA3.
     # https://github.com/pytorch/torchtitan/pull/4413
     if has_cuda_capability(10, 0):
-        return "FA4"
-    if has_cuda_capability(9, 0):
-        return "FA3"
-    return None
+        impl, module = "FA4", "flash_attn.cute"
+    elif has_cuda_capability(9, 0):
+        impl, module = "FA3", "flash_attn_interface"
+    else:
+        return None
+    try:
+        found = importlib.util.find_spec(module) is not None
+    except ModuleNotFoundError:  # Parent package `flash_attn` missing.
+        found = False
+    if not found:
+        raise ValueError(
+            f"{impl} is required for Varlen attention, but '{module}' is not installed. "
+            f"Install a compatible {impl} wheel or explicitly select another attention backend."
+        )
+    return impl
+
+
+def activate_cuda_flash_attention_impl() -> None:
+    """Route torch's varlen attention to the FlashAttention build for this GPU."""
+    flash_attention_impl = get_cuda_flash_attention_impl()
+    if flash_attention_impl is not None:
+        # activate_flash_attention_impl() will restore internal global state
+        # and re-run register function, so we want to only call it once.
+        if current_flash_attention_impl() != flash_attention_impl:
+            try:
+                activate_flash_attention_impl(flash_attention_impl)
+            except (ImportError, RuntimeError, ValueError) as error:
+                capability = torch.cuda.get_device_capability()
+                raise RuntimeError(
+                    f"{flash_attention_impl} is required on detected SM "
+                    f"{capability[0]}.{capability[1]}, but activation failed."
+                ) from error
+    else:
+        warn_once(
+            logger,
+            "FA3/FA4 not available on this CUDA architecture, falling back to FA2.",
+        )
 
 
 def has_rocm_capability(major: int, minor: int) -> bool:
@@ -231,41 +269,6 @@ def get_peak_flops(device_name: str) -> float:
     else:  # for other GPU types, assume A100
         logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")
         return 312e12
-
-
-@dataclass(frozen=True)
-class Color:
-    black = "\033[30m"
-    red = "\033[31m"
-    green = "\033[32m"
-    yellow = "\033[33m"
-    blue = "\033[34m"
-    magenta = "\033[35m"
-    cyan = "\033[36m"
-    white = "\033[37m"
-    reset = "\033[39m"
-    orange = "\033[38;2;180;60;0m"
-    turquoise = "\033[38;2;54;234;195m"
-
-
-@dataclass(frozen=True)
-class NoColor:
-    black = ""
-    red = ""
-    green = ""
-    yellow = ""
-    blue = ""
-    magenta = ""
-    cyan = ""
-    white = ""
-    reset = ""
-    orange = ""
-    turquoise = ""
-
-
-assert set(NoColor.__dataclass_fields__.keys()) == set(
-    Color.__dataclass_fields__.keys()
-), "NoColor must have the same fields as Color."
 
 
 @contextlib.contextmanager

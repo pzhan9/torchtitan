@@ -18,18 +18,24 @@ from typing import Any
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
+from torchtitan.components.checkpointer import DATALOADER
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.data.types import TrainingMicrobatch
+from torchtitan.components.loss import combine_loss_metrics
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
-from torchtitan.components.validate import BaseValidator, Validator
-from torchtitan.config import apply_overrides, Configurable
+from torchtitan.components.validator import BaseValidator, Validator
+from torchtitan.config import (
+    apply_overrides,
+    Configurable,
+    OverrideConfig,
+    PrecisionConfig,
+)
 from torchtitan.config.validation import validate_model_training_config
 from torchtitan.distributed import utils as dist_utils
-from torchtitan.distributed.cuda_graph import cuda_graphs_supported
+from torchtitan.models.base.model import BaseModel
 from torchtitan.models.common.aux_loss import collect_aux_loss_metrics
 from torchtitan.observability import structured_logger as sl
 from torchtitan.observability.metrics import ensure_pp_loss_visible, MetricsProcessor
-from torchtitan.protocols.model import BaseModel
 from torchtitan.training_engine import TrainingEngine
 
 
@@ -51,6 +57,9 @@ class Trainer(Configurable):
 
         model: BaseModel.Config
 
+        precision: PrecisionConfig = field(default_factory=PrecisionConfig)
+        """Parameter, compute, and gradient-reduction dtypes of the model."""
+
         hf_assets_path: str = "./tests/assets/tokenizer"
         """
         Path to HF assets folder. This folder contains local copies of Hugging Face assets,
@@ -71,23 +80,20 @@ class Trainer(Configurable):
         create_seed_checkpoint: bool = False
         """Initialize and save an unsharded model-only checkpoint, then exit."""
 
+        override: OverrideConfig = field(default_factory=OverrideConfig)
+        """Registered overrides applied to this config tree when the trainer is
+        constructed."""
+
         def __post_init__(self):
             TrainingEngine.Config.__post_init__(self)
+            if (
+                self.dist_moe_runtime is not None
+                and self.precision.param_dtype != "bfloat16"
+            ):
+                raise ValueError("Dist-MoE requires precision.param_dtype='bfloat16'")
             if self.debug.batch_invariant:
                 raise ValueError(
                     "Batch-invariant mode is not needed in supervised learning."
-                )
-
-            if (
-                not self.training.disable_cuda_graphs
-                and cuda_graphs_supported()
-                and self.parallelism.pipeline_parallel_degree > 1
-                and self.validator is not None
-            ):
-                raise ValueError(
-                    "CUDA graphs with pipeline parallelism do not support "
-                    "validation because validation reinitializes the shared "
-                    "pipeline schedule. Disable validation or CUDA graphs."
                 )
 
             if self.model is not None:
@@ -96,8 +102,15 @@ class Trainer(Configurable):
                     parallelism=self.parallelism,
                     training=self.training,
                     debug=self.debug,
-                    activation_checkpoint=self.activation_checkpoint,
+                    activation_remat=self.activation_remat,
                     max_num_documents=self.dataloader.max_num_documents,
+                )
+            if self.create_seed_checkpoint and (
+                self.checkpointer is None or self.checkpointer.load_only
+            ):
+                raise ValueError(
+                    "create_seed_checkpoint requires a checkpointer with "
+                    "load_only=False."
                 )
 
         def to_dict(self) -> dict[str, Any]:
@@ -148,24 +161,15 @@ class Trainer(Configurable):
     @record
     def __init__(self, config: Config):
         self.config = config
-        model_config = copy.deepcopy(config.model)
-        model_config.set_sharding_(config.parallelism)
-        config.model = model_config
+        config.model = copy.deepcopy(config.model)
         if config.override.imports:
             apply_overrides(config.override, config)
         model_config = config.model
-        validate_model_training_config(
-            model_config,
-            parallelism=config.parallelism,
-            training=config.training,
-            debug=config.debug,
-            activation_checkpoint=config.activation_checkpoint,
-            max_num_documents=config.dataloader.max_num_documents,
-        )
 
         self.engine = self.engine_cls(
             config,
             model_config=model_config,
+            precision=config.precision,
             max_num_documents=config.dataloader.max_num_documents,
             output_dir=config.dump_folder,
         )
@@ -190,6 +194,7 @@ class Trainer(Configurable):
             config_dict=config.to_dict(),
             has_quantization=engine.has_quantization,
         )
+        self._local_num_flops_since_last_log = 0
         color = self.metrics_processor.color
 
         self.num_pp_microbatches = (
@@ -223,13 +228,13 @@ class Trainer(Configurable):
             dp_world_size=dp_degree,
             dp_rank=dp_rank,
             tokenizer=self.tokenizer,
-            max_context_length=config.training.max_context_length,
+            max_context_length=config.model.max_context_length,
             num_tokens_per_microbatch=num_tokens_per_microbatch,
         )
 
         try:
             engine.initialize(
-                dataloader=self.dataloader,
+                extra_states={DATALOADER: self.dataloader},
                 hf_assets_path=config.hf_assets_path,
                 create_seed_checkpoint=config.create_seed_checkpoint,
             )
@@ -245,7 +250,6 @@ class Trainer(Configurable):
                 pp_schedule=config.parallelism.pipeline_parallel_schedule,
                 color=color,
             )
-        self.metrics_processor.num_flops_per_token = engine.num_flops_per_token
         self.metrics_processor.optimizers = engine.optim.optimizers
         self.metrics_processor.model_parts = engine.model_parts
 
@@ -272,6 +276,8 @@ class Trainer(Configurable):
             )
 
             self.validator = config.validator.build(
+                accelerator_graph_enabled=engine._forward_backward_accelerator_graph_enabled,
+                cuda_graph_annotation_config=config.profiler.maybe_cuda_graph_annotation_config(),
                 parallelism=config.parallelism,
                 dp_world_size=dp_degree,
                 dp_rank=dp_rank,
@@ -279,7 +285,7 @@ class Trainer(Configurable):
                 parallelism_context=parallelism_context,
                 loss_fn=engine.loss_fn,
                 metrics_processor=self.metrics_processor,
-                seq_len=config.training.max_context_length,
+                seq_len=config.model.max_context_length,
                 num_tokens_per_microbatch=num_tokens_per_microbatch,
                 pp_schedule=pp_schedule,
                 pp_has_first_stage=pp_has_first_stage,
@@ -291,7 +297,7 @@ class Trainer(Configurable):
             f"{num_tokens_per_dp_rank} tokens per DP rank, "
             f"{num_tokens_per_train_step} tokens per train step, "
             f"gradient accumulation steps {self.gradient_accumulation_steps}, "
-            f"maximum context length {config.training.max_context_length}, "
+            f"maximum context length {config.model.max_context_length}, "
             f"total steps {config.training.steps} "
             f"(warmup {config.optim.lr_scheduler.warmup_steps})"
         )
@@ -336,6 +342,7 @@ class Trainer(Configurable):
         # step_last_log on the first step, so keep this check after it.
         if self.metrics_processor.step_last_log == engine.num_completed_steps:
             self.metrics_processor.reset()
+            self._local_num_flops_since_last_log = 0
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
@@ -402,20 +409,38 @@ class Trainer(Configurable):
         # scheduler advances in engine.optim_step().
         lr_metrics = engine.optim.lr_schedulers.get_metrics() if should_log else {}
         grad_norm = engine.optim_step()
+        self._local_num_flops_since_last_log += forward_backward_result.num_flops
 
         # log metrics
         if not should_log:
             return
 
         accumulated_loss = forward_backward_result.loss
+        mean_num_flops = self._local_num_flops_since_last_log
 
         with sl.log_trace_span("collect_dist_metrics"):
             sl.log_trace_scalar(
                 {"global_valid_tokens": int(global_main_loss_token_count)}
             )
 
+            # Combine loss metrics over microbatches and loss-mesh ranks; under PP,
+            # ranks without the last stage have none.
+            # TODO(#4202): migrate loss-metric collection to the distributed
+            # tensor logging framework once it lands.
+            loss_mesh = parallelism_context.get_optional_mesh("loss")
+            loss_metrics = {
+                key: float(value.item())
+                for key, value in combine_loss_metrics(
+                    (
+                        microbatch_metrics
+                        for group_metrics in forward_backward_result.loss_metrics
+                        for microbatch_metrics in group_metrics
+                    ),
+                    mesh=loss_mesh,
+                ).items()
+            }
+
             if parallelism_context.dp_cp_enabled:
-                loss_mesh = parallelism_context.get_optional_mesh("loss")
 
                 # For global_avg_loss, we want the average loss across all ranks:
                 # accumulated_loss = local_loss_sum / global_valid_tokens
@@ -443,6 +468,19 @@ class Trainer(Configurable):
                         loss_mesh,
                     ),
                 )
+                if parallelism_context.dp_enabled:
+                    dp_mesh = parallelism_context.get_mesh("dp")
+                    mean_num_flops = (
+                        dist_utils.dist_sum(
+                            torch.tensor(
+                                mean_num_flops,
+                                dtype=torch.float64,
+                                device=engine.device,
+                            ),
+                            dp_mesh,
+                        )
+                        / dp_mesh.size()
+                    )
             else:
                 global_avg_loss = global_max_loss = float(accumulated_loss.item())
                 global_ntokens_seen = engine.ntokens_seen
@@ -451,6 +489,7 @@ class Trainer(Configurable):
             "n_tokens_seen": global_ntokens_seen,
             **lr_metrics,
             **collect_aux_loss_metrics(parallelism_context),
+            **loss_metrics,
         }
         self.metrics_processor.log(
             engine.num_completed_steps,
@@ -458,6 +497,7 @@ class Trainer(Configurable):
             global_max_loss,
             float(grad_norm.item()),
             extra_metrics=extra_metrics,
+            num_flops=mean_num_flops,
         )
 
     @record
@@ -493,10 +533,8 @@ class Trainer(Configurable):
                         last_step=(engine.num_completed_steps == config.training.steps)
                     )
 
-                    # Run validation if validator is available
-                    if (
-                        self.config.validator is not None
-                        and self.validator.should_validate(engine.num_completed_steps)
+                    if config.validator is not None and self.validator.should_validate(
+                        engine.num_completed_steps
                     ):
                         self.validator.validate(
                             engine.model_parts, engine.num_completed_steps

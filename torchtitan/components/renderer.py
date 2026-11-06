@@ -20,8 +20,8 @@ from torchtitan.config import Configurable
 class RendererConfig(Configurable.Config):
     """Base config of a renderer; `build` returns a `renderers.Renderer` on TorchTitan's tokenizer.
 
-    Subclasses: `RenderersConfigAdapter` for a renderer from the `renderers` library, and
-    in-tree renderers such as `MuseGlimmerRendererConfig`.
+    `RenderersConfigAdapter` adapts library configs, including in-tree renderers
+    selected with `CustomRendererConfig`.
     """
 
     # pyrefly: ignore[bad-override]
@@ -47,27 +47,39 @@ class RenderersConfigAdapter(RendererConfig):
             [{"role": "user", "content": "hi"}],
             add_generation_prompt=True,
         )
+
+    In-tree renderers use `CustomRendererConfig(import_path=..., **options)`.
+    Workers import the renderer and build it with the checkpoint tokenizer. It must
+    provide a `BaseRendererConfig` `config_class` and implement the `Renderer`
+    protocol, including `parse_response(..., prompt_ids=...)`. Pass the custom
+    config to `from_renderers` to use it in TorchTitan and Verifiers alike.
     """
 
     renderers_config: PrimeRendererConfig
     """The library's typed config for the model, e.g. `Qwen3RendererConfig(enable_thinking=False)`.
     Renderers and their options:
-    https://github.com/PrimeIntellect-ai/renderers/blob/renderers-v0.1.11/docs/renderer-config.md"""
+    https://github.com/PrimeIntellect-ai/renderers/blob/renderers-v0.1.12/docs/renderer-config.md"""
 
     def to_dict(self) -> dict[str, Any]:
         return {"renderers_config": self.renderers_config.model_dump(mode="json")}
+
+    def get_renderers_config(self) -> PrimeRendererConfig:
+        """Return the `renderers` config that Verifiers workers rebuild the renderer from."""
+        return self.renderers_config
 
     def build(self, *, tokenizer: HuggingFaceTokenizer) -> Renderer:
         if self.renderers_config.name == "auto":
             raise ValueError(
                 f"AutoRendererConfig resolves by exact match of tokenizer.name_or_path ({tokenizer.tokenizer_path!r}) "
                 "against renderers' MODEL_RENDERER_MAP, else falls back to DefaultRenderer (unsupported here). "
-                "Pick the model's renderer, e.g. Qwen3RendererConfig(...)."
+                "Pick the model's renderer, e.g. Qwen3RendererConfig(...), or name an in-tree renderer with "
+                "CustomRendererConfig(import_path=...)."
             )
         if self.renderers_config.name == "default":
             raise ValueError(
-                "DefaultRenderer needs Hugging Face apply_chat_template; TorchTitan's template rendering lacks "
-                "its special-token variables (bos_token, ...) and would silently produce different tokens. "
+                "DefaultRenderer needs Hugging Face apply_chat_template; TorchTitan passes "
+                "bos_token and eos_token only, not the rest of the special-token map "
+                "(pad_token, unk_token, ...), and would silently produce different tokens. "
                 "Pick the model's renderer, e.g. Qwen3RendererConfig(...)."
             )
         return create_renderer(
@@ -84,8 +96,8 @@ class RendererTokenizerWrapper:
     """Adapt TorchTitan's loaded tokenizer to `renderers.OffsetTokenizer`.
 
     Protocol and bring-your-own-tokenizer guide:
-    https://github.com/PrimeIntellect-ai/renderers/blob/renderers-v0.1.11/renderers/base.py#L668-L699
-    https://github.com/PrimeIntellect-ai/renderers/blob/renderers-v0.1.11/README.md#install
+    https://github.com/PrimeIntellect-ai/renderers/blob/renderers-v0.1.12/renderers/base.py#L680-L711
+    https://github.com/PrimeIntellect-ai/renderers/blob/renderers-v0.1.12/README.md#install
 
     `renderers` needs Hugging Face-style special-token attributes, raw encoding
     without automatic BOS/EOS, token-to-id lookup, and character offsets. The

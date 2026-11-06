@@ -12,16 +12,20 @@ fusion over a full token sequence. ``build_vision_bank_indices`` and
 packed-bank row for every placeholder token.
 """
 
-from typing import Self
+from dataclasses import dataclass
+from typing import cast, Self
 
 import spmd_types as spmd
 import torch
 
-from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
+from torchtitan.config import PrecisionConfig, TORCH_DTYPE_MAP
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
-from torchtitan.distributed.local_compile import apply_local_compile
+from torchtitan.distributed.activation_remat import ActivationRematConfig
+from torchtitan.distributed.local_compile import LocalCompileConfig
 from torchtitan.distributed.parallelism_context import ParallelismContext
+
+from torchtitan.models.base.model import FlopsEstimator
+from torchtitan.models.base.module import Module
 
 from .decoder import Decoder
 
@@ -31,18 +35,52 @@ class MultimodalModel(Decoder):
 
     multimodal_encoder_fqns: tuple[str, ...] = ()
 
+    @dataclass(kw_only=True, slots=True)
+    class Config(Decoder.Config):
+        def build_flops_estimator(
+            self,
+            model: Module,
+            *,
+            seq_len: int,
+            excluded_submodules: tuple[Module | None, ...] = (),
+        ) -> FlopsEstimator:
+            model = cast(MultimodalModel, model)
+            encoder_modules = []
+            encoder_estimates = []
+            for encoder_fqn in model.multimodal_encoder_fqns:
+                encoder = getattr(model, encoder_fqn)
+                encoder_modules.append(encoder)
+                if encoder is None:
+                    continue
+                encoder_config = getattr(self, encoder_fqn)
+                estimate = encoder_config.build_flops_estimator(encoder)
+                encoder_estimates.append(estimate)
+            decoder_estimate = super(
+                MultimodalModel.Config, self
+            ).build_flops_estimator(
+                model,
+                seq_len=seq_len,
+                excluded_submodules=(
+                    *encoder_modules,
+                    *excluded_submodules,
+                ),
+            )
+            return lambda input_dict: decoder_estimate(input_dict) + sum(
+                estimate(input_dict) for estimate in encoder_estimates
+            )
+
     def parallelize(
         self,
         *,
         parallelism_context: ParallelismContext,
-        training: TrainingConfig,
+        precision: PrecisionConfig,
         parallelism: ParallelismConfig,
-        local_compile_regions: list[str],
-        ac_config: ActivationCheckpointingConfig | None,
+        local_compile: LocalCompileConfig,
+        activation_remat: ActivationRematConfig | None,
         dump_folder: str,
     ) -> Self:
         # Bind local implementations early; torch.compile traces on first use.
-        apply_local_compile(local_compile_regions)
+        local_compile.apply()
         with parallelism_context.activate_spmd():
             self._parallelize(parallelism_context)
             encoders = [
@@ -50,15 +88,14 @@ class MultimodalModel(Decoder):
                 for encoder_fqn in self.multimodal_encoder_fqns
                 if (encoder := getattr(self, encoder_fqn)) is not None
             ]
-            if ac_config is not None:
-                policy = ac_config.build(dump_folder=dump_folder)
-                policy.apply(self)
+            if activation_remat is not None:
+                activation_remat.apply(self)
                 for encoder in encoders:
-                    policy.apply(encoder)
+                    activation_remat.apply(encoder)
 
             self._apply_fsdp(
                 parallelism_context=parallelism_context,
-                training=training,
+                precision=precision,
                 parallelism=parallelism,
             )
         return self
@@ -67,7 +104,7 @@ class MultimodalModel(Decoder):
         self,
         *,
         parallelism_context: ParallelismContext,
-        training: TrainingConfig,
+        precision: PrecisionConfig,
         parallelism: ParallelismConfig,
     ) -> None:
         from torchtitan.distributed.fsdp import (
@@ -75,26 +112,28 @@ class MultimodalModel(Decoder):
             resolve_fsdp_mesh,
         )
 
-        if not parallelism_context.pp_enabled:
-            dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
-            for encoder_fqn in self.multimodal_encoder_fqns:
-                encoder = getattr(self, encoder_fqn)
-                if encoder is not None:
-                    apply_fsdp_to_multimodal_encoder(
-                        encoder,
-                        dp_mesh,
-                        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-                        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-                        reshard_after_forward_policy=(
-                            parallelism.fsdp_reshard_after_forward
-                        ),
-                        pp_enabled=parallelism_context.pp_enabled,
-                        cpu_offload=training.enable_cpu_offload,
-                        dp_mesh_dims=dp_mesh_dims,
-                    )
+        # Encoders are CP-invariant, so FSDP shards them over dp_shard only.
+        # That differs from the decoder, so they always get their own FSDP
+        # wrapper, including under PP.
+        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(
+            parallelism_context, shard_on_cp_axis=False
+        )
+        for encoder_fqn in self.multimodal_encoder_fqns:
+            encoder = getattr(self, encoder_fqn)
+            if encoder is not None:
+                apply_fsdp_to_multimodal_encoder(
+                    encoder,
+                    dp_mesh,
+                    param_dtype=TORCH_DTYPE_MAP[precision.param_dtype],
+                    reduce_dtype=TORCH_DTYPE_MAP[precision.reduce_dtype],
+                    reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+                    pp_enabled=parallelism_context.pp_enabled,
+                    cpu_offload=parallelism.fsdp_enable_cpu_offloading,
+                    dp_mesh_dims=dp_mesh_dims,
+                )
         super()._apply_fsdp(
             parallelism_context=parallelism_context,
-            training=training,
+            precision=precision,
             parallelism=parallelism,
         )
 
@@ -113,6 +152,7 @@ def build_dummy_vision_inputs(
         for tensor in (pixel_values_TP, grid_thw_N3):
             spmd.mutate_type(tensor, "dp", src=spmd.R, dst=spmd.V)
             spmd.mutate_type(tensor, "tp", src=spmd.R, dst=spmd.I)
+            spmd.mutate_type(tensor, "cp", src=spmd.R, dst=spmd.I)
     return pixel_values_TP, grid_thw_N3
 
 

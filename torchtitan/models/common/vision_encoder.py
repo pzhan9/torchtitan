@@ -20,22 +20,24 @@ Shape suffixes:
 - Dh = head dim
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 import spmd_types as spmd
 import torch
 import torch_remat as remat
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
+from torchtitan.distributed.local_compile import compile
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_mesh_group
+from torchtitan.models.base.module import Module
 from torchtitan.models.common.attention import FlexInnerAttention, local_head_split
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import GELU, LayerNorm, RMSNorm
-from torchtitan.protocols.module import Module
 
-compiled_create_block_mask = torch.compile(create_block_mask)
+compiled_create_block_mask = compile(create_block_mask)
 
 # Applies rotary position embedding: (query, key, rope_cache) -> (query, key).
 RopeApply = Callable[
@@ -58,7 +60,7 @@ class InvariantRowParallelLinear(Linear):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         tp_group = spmd_mesh_group(MeshAxisName.TP)
-        weight, bias = self._flatten_weight_and_bias()
+        weight, bias = self.weight, self.bias
         linear_fn = remat.region(
             self._linear,
             self.remat_region_name("linear"),
@@ -77,7 +79,7 @@ class InvariantRowParallelLinear(Linear):
             # TODO: Remove this suppression once spmd_types recognizes the
             # rowwise F.linear type combination [V, V, P] -> P.
             with spmd.no_typecheck():
-                output = self._unflatten_output(linear_fn(input, weight, bias))
+                output = self._unflatten_output(linear_fn(input, weight, bias), weight)
             if spmd.is_type_checking():
                 spmd.assert_local_type_like(
                     output,
@@ -85,7 +87,7 @@ class InvariantRowParallelLinear(Linear):
                     {tp_group: spmd.P},  # pyrefly: ignore [bad-argument-type]
                 )
         else:
-            output = self._unflatten_output(linear_fn(input, weight, bias))
+            output = self._unflatten_output(linear_fn(input, weight, bias), weight)
         if tp_group is None:
             return output
         # A recomputed reduction after a saved projection keeps the TP-times
@@ -173,6 +175,9 @@ class VisionAttention(Module):
         inner_attention: Module.Config = field(
             default_factory=FlexInnerAttention.Config
         )
+
+        def flops_per_query_key_pair(self) -> int:
+            return 12 * self.dim
 
     def __init__(self, config: Config):
         super().__init__()
@@ -266,3 +271,18 @@ class VisionTransformerBlock(Module):
         return remat.region(
             torch.add, self.remat_region_name("ffn_residual"), recompute=False
         )(x, mlp_out)
+
+
+def get_packed_vision_grids(
+    input_dict: Mapping[str, Any]
+) -> tuple[tuple[int, int, int], ...]:
+    """Extract image and video patch grids from a raw CPU microbatch."""
+    return tuple(
+        (temporal, height, width)
+        for pixels, grid_key in (
+            ("pixel_values", "grid_thw"),
+            ("pixel_values_videos", "grid_thw_videos"),
+        )
+        if input_dict.get(pixels) is not None
+        for temporal, height, width in input_dict[grid_key].tolist()
+    )
